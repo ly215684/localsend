@@ -220,7 +220,7 @@ export default function App() {
         }));
         
         // 标题闪烁提醒
-        document.title = `(${ (unreadCounts[targetId] || 0) + 1 }) New Message - LocalSend`;
+        document.title = `(${ (unreadCounts[targetId] || 0) + 1 }) 新消息 - LocalSend`;
       }
     });
 
@@ -291,7 +291,7 @@ export default function App() {
     };
   }, [socket]); // 依赖 socket
 
-  if (!socket) return <div className="flex h-screen items-center justify-center text-gray-500">Connecting...</div>;
+  if (!socket) return <div className="flex h-screen items-center justify-center text-gray-500">正在连接...</div>;
 
   const createPeerConnection = (targetId) => {
     if (peerConnections.current[targetId]) return peerConnections.current[targetId];
@@ -551,13 +551,13 @@ export default function App() {
     const roomId = roomInput.trim();
     
     if (customRooms.some(r => r.id === roomId)) {
-      alert('You have already joined this room');
+      alert('你已加入该房间');
       return;
     }
     
     const newRoom = {
       id: roomId,
-      username: `Room: ${roomId}`,
+      username: `房间: ${roomId}`,
       avatarColor: getAvatarColor(roomId),
       isCustomRoom: true
     };
@@ -669,7 +669,7 @@ export default function App() {
                     <h1 className="font-bold text-lg leading-tight truncate">{username}</h1>
                     <Edit2 size={14} className="opacity-0 group-hover:opacity-50 transition-opacity" />
                   </div>
-                  <p className="text-xs text-blue-100 opacity-80">My ID: {myId?.slice(0,6)}...</p>
+                  <p className="text-xs text-blue-100 opacity-80">我的 ID: {myId?.slice(0,6)}...</p>
                </div>
              )}
           </div>
@@ -706,11 +706,11 @@ export default function App() {
           
           {/* Custom Rooms Section */}
           <div className="px-4 mb-2 flex items-center justify-between group">
-            <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider">Chat Rooms</h3>
+            <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider">聊天室</h3>
             <button 
               onClick={() => setIsAddingRoom(true)}
               className="p-1 text-gray-400 hover:text-blue-600 rounded transition-colors"
-              title="Join Room"
+              title="加入房间"
             >
               <Plus size={14} />
             </button>
@@ -724,7 +724,7 @@ export default function App() {
                    value={roomInput}
                    onChange={(e) => setRoomInput(e.target.value)}
                    onKeyDown={(e) => e.key === 'Enter' && handleAddRoom()}
-                   placeholder="Room ID..."
+                   placeholder="输入房间号..."
                    className="flex-1 text-xs p-1.5 rounded border border-gray-200 outline-none focus:border-blue-400"
                  />
                  <button onClick={handleAddRoom} className="p-1.5 bg-blue-600 text-white rounded hover:bg-blue-700">
@@ -760,12 +760,12 @@ export default function App() {
                        </span>
                      )}
                  </div>
-                 <p className="text-xs text-gray-500 truncate">Custom Room</p>
+                 <p className="text-xs text-gray-500 truncate">自定义房间</p>
                </div>
                <button 
                  onClick={(e) => handleLeaveRoom(room.id, e)}
                  className="absolute right-2 top-2 p-1 text-gray-400 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity"
-                 title="Leave Room"
+                 title="退出房间"
                >
                  <Users size={14} className="rotate-45" /> 
                </button>
@@ -775,7 +775,7 @@ export default function App() {
           <div className="h-px bg-gray-100 mx-4 my-2"></div>
           
           <div className="px-4 mb-2">
-            <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider">Online Users</h3>
+            <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider">在线用户</h3>
           </div>
 
           {users.filter(u => u.id !== myId && u.id !== socket.id).length === 0 ? (
@@ -848,12 +848,12 @@ export default function App() {
               <div className="flex-1 min-w-0">
                 <h2 className="font-bold text-gray-800 truncate text-base">{selectedUser.username}</h2>
                 {selectedUser.id === PUBLIC_ROOM_ID ? (
-                  <p className="text-xs text-blue-500 font-medium">Public Channel</p>
+                  <p className="text-xs text-blue-500 font-medium">公共频道</p>
                 ) : selectedUser.isCustomRoom ? (
-                  <p className="text-xs text-indigo-500 font-medium">ID: {selectedUser.id}</p>
+                  <p className="text-xs text-indigo-500 font-medium">房间号: {selectedUser.id}</p>
                 ) : (
                   <p className="text-xs text-green-600 flex items-center gap-1 font-medium">
-                    <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span> Online
+                    <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span> 在线
                   </p>
                 )}
               </div>
@@ -873,7 +873,7 @@ export default function App() {
                     {msg.type === 'text' && (
                       <div className="flex flex-col">
                         {(selectedUser.id === PUBLIC_ROOM_ID || selectedUser.isCustomRoom) && msg.sender !== 'me' && (
-                          <span className="text-[10px] text-gray-500 font-bold mb-1 opacity-75">{msg.realSenderName || 'Unknown'}</span>
+                          <span className="text-[10px] text-gray-500 font-bold mb-1 opacity-75">{msg.realSenderName || '未知用户'}</span>
                         )}
                         <p className="leading-relaxed whitespace-pre-wrap">{msg.content}</p>
                       </div>
