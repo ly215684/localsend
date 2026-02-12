@@ -1,0 +1,16 @@
+{
+  "name": "LocalSend Web",
+  "short_name": "LocalSend",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#2563eb",
+  "description": "局域网高速文件传输",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
