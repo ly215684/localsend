@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
-import { Send, Paperclip, ArrowLeft, User, Monitor, File, Download, Edit2, Check } from 'lucide-react';
+import { Send, Paperclip, ArrowLeft, User, Monitor, File, Download, Edit2, Check, Users, Plus, Hash } from 'lucide-react';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -78,6 +78,14 @@ const ColorPicker = ({ selectedColor, onSelect }) => {
 // 或者硬编码 localhost:3000
 const SERVER_URL = `http://${window.location.hostname}:3000`;
 
+const PUBLIC_ROOM_ID = 'public-room';
+const PUBLIC_ROOM_USER = {
+  id: PUBLIC_ROOM_ID,
+  username: '公共聊天室',
+  avatarColor: 'bg-blue-600',
+  isPublic: true
+};
+
 export default function App() {
   const [socket, setSocket] = useState(null);
   const [myId, setMyId] = useState('');
@@ -87,6 +95,18 @@ export default function App() {
   const [isEditingName, setIsEditingName] = useState(false);
   const [showColorPicker, setShowColorPicker] = useState(false);
   const [tempName, setTempName] = useState('');
+  
+  // Custom Rooms
+  const [customRooms, setCustomRooms] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('customRooms') || '[]');
+    } catch {
+      return [];
+    }
+  });
+  const [isAddingRoom, setIsAddingRoom] = useState(false);
+  const [roomInput, setRoomInput] = useState('');
+
   const [selectedUser, setSelectedUser] = useState(null);
   const [messages, setMessages] = useState({}); // { userId: [msg1, msg2] }
   const [unreadCounts, setUnreadCounts] = useState({}); // { userId: count }
@@ -100,15 +120,65 @@ export default function App() {
   const fileMeta = useRef({}); // { userId: { name, size, type, receivedSize } }
   const pendingCandidates = useRef({}); // { userId: [RTCIceCandidate, ...] }
 
-  // Socket 初始化
   useEffect(() => {
-    const newSocket = io(SERVER_URL);
+    localStorage.setItem('customRooms', JSON.stringify(customRooms));
+    if (socket && socket.connected) {
+      customRooms.forEach(room => socket.emit('join-room', room.id));
+    }
+  }, [customRooms, socket]);
+
+  // Socket Initialization
+  useEffect(() => {
+    // Use the same port as server (3000)
+    const serverPort = 3000;
+    const url = window.location.hostname === 'localhost' 
+      ? `http://localhost:${serverPort}` 
+      : `http://${window.location.hostname}:${serverPort}`;
+
+    const newSocket = io(url, {
+      transports: ['websocket', 'polling'],
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
+    });
     setSocket(newSocket);
+
+    const onConnect = () => {
+      console.log('Connected with ID:', newSocket.id);
+      setMyId(newSocket.id);
+      
+      // 必须发送 'join' 事件，否则服务器不会将用户加入列表
+      const currentName = username || `User-${newSocket.id.slice(0, 4)}`;
+      const currentColor = avatarColor || getAvatarColor(currentName);
+
+      // 如果没有本地用户名，初始化一个
+      if (!username) {
+        setUsername(currentName);
+        localStorage.setItem('username', currentName);
+      }
+      if (!avatarColor) {
+        setAvatarColor(currentColor);
+        localStorage.setItem('avatarColor', currentColor);
+      }
+
+      newSocket.emit('join', {
+        username: currentName,
+        avatarColor: currentColor
+      });
+
+      // Re-join custom rooms
+      customRooms.forEach(room => newSocket.emit('join-room', room.id));
+    };
+
+    newSocket.on('connect', onConnect);
+
+    newSocket.on('user-list', (userList) => {
+      setUsers(userList);
+    });
 
     return () => {
       newSocket.disconnect();
     };
-  }, []);
+  }, []); // Only run once on mount
 
   useEffect(() => {
     if (!socket) return;
@@ -117,55 +187,40 @@ export default function App() {
     const handleResize = () => setIsMobileView(window.innerWidth < 768);
     window.addEventListener('resize', handleResize);
 
-    // Socket 事件监听
-    socket.on('connect', () => {
-      setMyId(socket.id);
-      // 如果本地有用户名则使用，否则生成默认
-      const initialName = username || `User-${socket.id.slice(0, 4)}`;
-      const initialColor = avatarColor || getAvatarColor(initialName);
-      
-      if (!username) {
-        setUsername(initialName);
-        localStorage.setItem('username', initialName);
-      }
-      if (!avatarColor) {
-        setAvatarColor(initialColor);
-        localStorage.setItem('avatarColor', initialColor);
-      }
-
-      socket.emit('join', {
-        username: initialName,
-        avatarColor: initialColor
-      });
-    });
-
-    socket.on('user-list', (userList) => {
-      // 过滤掉自己 (确保 socket.id 存在)
-      const currentId = socket.id;
-      if (currentId) {
-        setUsers(userList.filter(u => u.id !== currentId));
-      } else {
-        setUsers(userList);
-      }
-    });
-
     socket.on('chat-message', (data) => {
-      addMessage(data.sender, {
-        sender: 'them',
+      // 区分私聊、群聊和自定义聊天室
+      const isPublic = data.sender === PUBLIC_ROOM_ID;
+      const isRoom = data.isRoom;
+      
+      let targetId;
+      if (isPublic) {
+        targetId = PUBLIC_ROOM_ID;
+      } else if (isRoom) {
+        targetId = data.roomId;
+      } else {
+        targetId = data.sender;
+      }
+      
+      const msg = {
+        sender: (isPublic || isRoom) ? (data.realSenderId === myId ? 'me' : 'them') : 'them',
+        realSenderName: data.realSenderName, // 群聊时显示真实用户名
+        realSenderId: data.realSenderId,
         type: 'text',
         content: data.message,
         timestamp: data.timestamp
-      });
+      };
+
+      addMessage(targetId, msg);
       
       // 如果不在当前聊天窗口，增加未读计数
-      if (selectedUser?.id !== data.sender) {
+      if (selectedUser?.id !== targetId) {
         setUnreadCounts(prev => ({
           ...prev,
-          [data.sender]: (prev[data.sender] || 0) + 1
+          [targetId]: (prev[targetId] || 0) + 1
         }));
         
         // 标题闪烁提醒
-        document.title = `(${ (unreadCounts[data.sender] || 0) + 1 }) New Message - LocalSend`;
+        document.title = `(${ (unreadCounts[targetId] || 0) + 1 }) New Message - LocalSend`;
       }
     });
 
@@ -460,19 +515,65 @@ export default function App() {
   const handleSendMessage = () => {
     if (!inputText.trim() || !selectedUser) return;
     
-    socket.emit('chat-message', {
-      target: selectedUser.id,
-      message: inputText
-    });
+    // 如果是自定义聊天室
+    if (selectedUser.isCustomRoom) {
+      socket.emit('chat-message', {
+        target: selectedUser.id,
+        message: inputText,
+        isRoom: true
+      });
+    } else {
+      socket.emit('chat-message', {
+        target: selectedUser.id,
+        message: inputText
+      });
+    }
 
-    addMessage(selectedUser.id, {
-      sender: 'me',
-      type: 'text',
-      content: inputText,
-      timestamp: new Date().toISOString()
-    });
+    // 如果是群聊或自定义聊天室，不用在这里手动添加消息，因为服务器会广播回所有
+    // 修正：服务器 index.js 中 io.emit('chat-message', ...sender: 'public-room')
+    // 前端收到 sender: 'public-room' 且 realSenderId === myId 时，标记为 'me'。
+    // 所以群聊不需要在这里手动 addMessage，否则会重复。
+    
+    if (selectedUser.id !== PUBLIC_ROOM_ID && !selectedUser.isCustomRoom) {
+      addMessage(selectedUser.id, {
+        sender: 'me',
+        type: 'text',
+        content: inputText,
+        timestamp: new Date().toISOString()
+      });
+    }
 
     setInputText('');
+  };
+
+  const handleAddRoom = () => {
+    if (!roomInput.trim()) return;
+    const roomId = roomInput.trim();
+    
+    if (customRooms.some(r => r.id === roomId)) {
+      alert('You have already joined this room');
+      return;
+    }
+    
+    const newRoom = {
+      id: roomId,
+      username: `Room: ${roomId}`,
+      avatarColor: getAvatarColor(roomId),
+      isCustomRoom: true
+    };
+    
+    setCustomRooms(prev => [...prev, newRoom]);
+    setRoomInput('');
+    setIsAddingRoom(false);
+  };
+  
+  const handleLeaveRoom = (roomId, e) => {
+    e.stopPropagation(); // Prevent selection
+    setCustomRooms(prev => prev.filter(r => r.id !== roomId));
+    socket.emit('leave-room', roomId);
+    if (selectedUser?.id === roomId) {
+      setSelectedUser(null);
+    }
   };
 
   const handleFileSelect = (e) => {
@@ -575,6 +676,108 @@ export default function App() {
         </div>
         
         <div className="flex-1 overflow-y-auto p-2 scroll-smooth">
+          {/* 公共聊天室入口 */}
+          <div
+            onClick={() => handleSelectUser(PUBLIC_ROOM_USER)}
+            className={cn(
+              "flex items-center gap-4 p-4 rounded-xl cursor-pointer mb-2 transition-all active:scale-[0.98]",
+              selectedUser?.id === PUBLIC_ROOM_ID ? "bg-blue-50 border border-blue-100 shadow-sm" : "bg-white hover:bg-gray-50 border border-transparent shadow-sm md:shadow-none"
+            )}
+          >
+            <div className="relative">
+                <div className="w-12 h-12 rounded-full flex items-center justify-center bg-blue-100 text-blue-600 border border-blue-200">
+                    <Users size={24} />
+                </div>
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex justify-between items-center mb-1">
+                  <h3 className="font-bold text-gray-800 truncate">公共聊天室</h3>
+                  {unreadCounts[PUBLIC_ROOM_ID] > 0 && (
+                    <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full min-w-[18px] text-center shadow-sm animate-bounce">
+                      {unreadCounts[PUBLIC_ROOM_ID] > 99 ? '99+' : unreadCounts[PUBLIC_ROOM_ID]}
+                    </span>
+                  )}
+              </div>
+              <p className="text-xs text-gray-500 truncate">所有人可见</p>
+            </div>
+          </div>
+
+          <div className="h-px bg-gray-100 mx-4 my-2"></div>
+          
+          {/* Custom Rooms Section */}
+          <div className="px-4 mb-2 flex items-center justify-between group">
+            <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider">Chat Rooms</h3>
+            <button 
+              onClick={() => setIsAddingRoom(true)}
+              className="p-1 text-gray-400 hover:text-blue-600 rounded transition-colors"
+              title="Join Room"
+            >
+              <Plus size={14} />
+            </button>
+          </div>
+
+          {isAddingRoom && (
+            <div className="mx-4 mb-2 p-2 bg-gray-50 rounded border border-blue-200 animate-in fade-in slide-in-from-top-2">
+               <div className="flex gap-2">
+                 <input 
+                   autoFocus
+                   value={roomInput}
+                   onChange={(e) => setRoomInput(e.target.value)}
+                   onKeyDown={(e) => e.key === 'Enter' && handleAddRoom()}
+                   placeholder="Room ID..."
+                   className="flex-1 text-xs p-1.5 rounded border border-gray-200 outline-none focus:border-blue-400"
+                 />
+                 <button onClick={handleAddRoom} className="p-1.5 bg-blue-600 text-white rounded hover:bg-blue-700">
+                   <Check size={12} />
+                 </button>
+                 <button onClick={() => setIsAddingRoom(false)} className="p-1.5 bg-gray-200 text-gray-600 rounded hover:bg-gray-300">
+                   <Users size={12} className="rotate-45" /> 
+                 </button>
+               </div>
+            </div>
+          )}
+
+          {customRooms.map(room => (
+             <div
+               key={room.id}
+               onClick={() => handleSelectUser(room)}
+               className={cn(
+                 "flex items-center gap-4 p-4 rounded-xl cursor-pointer mb-2 transition-all active:scale-[0.98] group relative",
+                 selectedUser?.id === room.id ? "bg-blue-50 border border-blue-100 shadow-sm" : "bg-white hover:bg-gray-50 border border-transparent shadow-sm md:shadow-none"
+               )}
+             >
+               <div className="relative">
+                   <div className="w-12 h-12 rounded-full flex items-center justify-center bg-indigo-100 text-indigo-600 border border-indigo-200">
+                       <Hash size={24} />
+                   </div>
+               </div>
+               <div className="flex-1 min-w-0">
+                 <div className="flex justify-between items-center mb-1">
+                     <h3 className="font-bold text-gray-800 truncate">{room.username}</h3>
+                     {unreadCounts[room.id] > 0 && (
+                       <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full min-w-[18px] text-center shadow-sm animate-bounce">
+                         {unreadCounts[room.id] > 99 ? '99+' : unreadCounts[room.id]}
+                       </span>
+                     )}
+                 </div>
+                 <p className="text-xs text-gray-500 truncate">Custom Room</p>
+               </div>
+               <button 
+                 onClick={(e) => handleLeaveRoom(room.id, e)}
+                 className="absolute right-2 top-2 p-1 text-gray-400 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity"
+                 title="Leave Room"
+               >
+                 <Users size={14} className="rotate-45" /> 
+               </button>
+             </div>
+          ))}
+
+          <div className="h-px bg-gray-100 mx-4 my-2"></div>
+          
+          <div className="px-4 mb-2">
+            <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider">Online Users</h3>
+          </div>
+
           {users.filter(u => u.id !== myId && u.id !== socket.id).length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-gray-400 p-8">
               <div className="w-16 h-16 bg-gray-50 rounded-full flex items-center justify-center mb-4">
@@ -631,12 +834,28 @@ export default function App() {
                   <ArrowLeft size={24} />
                 </button>
               )}
-              <Avatar name={selectedUser.username} color={selectedUser.avatarColor} size="md" />
+              {selectedUser.id === PUBLIC_ROOM_ID ? (
+                 <div className="w-10 h-10 rounded-full flex items-center justify-center bg-blue-100 text-blue-600 border border-blue-200">
+                    <Users size={20} />
+                 </div>
+              ) : selectedUser.isCustomRoom ? (
+                 <div className="w-10 h-10 rounded-full flex items-center justify-center bg-indigo-100 text-indigo-600 border border-indigo-200">
+                    <Hash size={20} />
+                 </div>
+              ) : (
+                <Avatar name={selectedUser.username} color={selectedUser.avatarColor} size="md" />
+              )}
               <div className="flex-1 min-w-0">
                 <h2 className="font-bold text-gray-800 truncate text-base">{selectedUser.username}</h2>
-                <p className="text-xs text-green-600 flex items-center gap-1 font-medium">
-                  <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span> Online
-                </p>
+                {selectedUser.id === PUBLIC_ROOM_ID ? (
+                  <p className="text-xs text-blue-500 font-medium">Public Channel</p>
+                ) : selectedUser.isCustomRoom ? (
+                  <p className="text-xs text-indigo-500 font-medium">ID: {selectedUser.id}</p>
+                ) : (
+                  <p className="text-xs text-green-600 flex items-center gap-1 font-medium">
+                    <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span> Online
+                  </p>
+                )}
               </div>
             </div>
 
@@ -651,7 +870,14 @@ export default function App() {
                     "max-w-[85%] md:max-w-[70%] rounded-2xl p-3 shadow-sm break-words",
                     msg.sender === 'me' ? "bg-blue-600 text-white rounded-tr-sm" : "bg-white text-gray-800 border border-gray-100 rounded-tl-sm"
                   )}>
-                    {msg.type === 'text' && <p className="leading-relaxed whitespace-pre-wrap">{msg.content}</p>}
+                    {msg.type === 'text' && (
+                      <div className="flex flex-col">
+                        {(selectedUser.id === PUBLIC_ROOM_ID || selectedUser.isCustomRoom) && msg.sender !== 'me' && (
+                          <span className="text-[10px] text-gray-500 font-bold mb-1 opacity-75">{msg.realSenderName || 'Unknown'}</span>
+                        )}
+                        <p className="leading-relaxed whitespace-pre-wrap">{msg.content}</p>
+                      </div>
+                    )}
                     {msg.type === 'file' && (
                       <div className="flex items-center gap-3 min-w-[200px]">
                         <div className={cn("p-2.5 rounded-xl", msg.sender === 'me' ? "bg-white/20" : "bg-gray-100")}>

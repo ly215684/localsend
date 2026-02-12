@@ -104,23 +104,52 @@ io.on('connection', (socket) => {
     });
   });
 
-  // 文字聊天
+  // 加入自定义聊天室
+  socket.on('join-room', (roomId) => {
+    socket.join(roomId);
+    console.log(`User ${socket.id} joined room ${roomId}`);
+  });
+
+  // 离开自定义聊天室
+  socket.on('leave-room', (roomId) => {
+    socket.leave(roomId);
+    console.log(`User ${socket.id} left room ${roomId}`);
+  });
+
+  // 聊天消息
   socket.on('chat-message', (data) => {
-    // data: { target: targetSocketId, message: string }
-    // 如果 target 存在则是私聊，否则可能是群聊（这里主要实现点对点）
-    if (data.target) {
-      socket.to(data.target).emit('chat-message', {
-        sender: socket.id,
-        message: data.message,
-        timestamp: new Date().toISOString()
-      });
+    // 如果 target 是 'public-room'，则广播给所有人
+    if (data.target === 'public-room') {
+       io.emit('chat-message', {
+         sender: 'public-room',
+         realSenderId: socket.id, // 真实的发送者 ID，用于前端区分显示头像
+         realSenderName: users.get(socket.id)?.username || 'Unknown',
+         message: data.message,
+         timestamp: new Date().toISOString()
+       });
+       console.log(`Public chat from ${socket.id}: ${data.message}`);
+    } else if (data.isRoom) {
+       // 自定义聊天室逻辑
+       // 广播给房间内的所有人（除了发送者自己，通常由前端乐观更新，或者 socket.to() 自动排除发送者）
+       // socket.to(room) 发送给房间内除了发送者之外的人
+       socket.to(data.target).emit('chat-message', {
+         sender: data.target, // 对接收者来说，sender 是房间 ID
+         realSenderId: socket.id,
+         realSenderName: users.get(socket.id)?.username || 'Unknown',
+         message: data.message,
+         isRoom: true,
+         roomId: data.target,
+         timestamp: new Date().toISOString()
+       });
+       console.log(`Room chat ${data.target} from ${socket.id}: ${data.message}`);
     } else {
-      // 广播
-      socket.broadcast.emit('chat-message', {
+      // 私聊逻辑
+      io.to(data.target).emit('chat-message', {
         sender: socket.id,
         message: data.message,
         timestamp: new Date().toISOString()
       });
+      console.log(`Message from ${socket.id} to ${data.target}`);
     }
   });
 
