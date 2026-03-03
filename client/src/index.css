@@ -6,8 +6,8 @@
   body {
     @apply bg-gray-50 text-gray-900;
     /* 禁止长按选中文本，提升 App 体验 */
-    -webkit-user-select: none;
-    user-select: none;
+    /* -webkit-user-select: none;
+    user-select: none; */
     /* 禁用高亮颜色 */
     -webkit-tap-highlight-color: transparent;
   }
