@@ -374,11 +374,15 @@ export default function App() {
       const data = event.data;
 
       if (typeof data === "string") {
-        // 可能是文件元数据
+        // 可能是文件元数据或块索引
         try {
-          const meta = JSON.parse(data);
-          if (meta.type === "file-meta") {
-            fileMeta.current[targetId] = { ...meta, receivedSize: 0 };
+          const parsed = JSON.parse(data);
+          if (parsed.type === "file-meta") {
+            fileMeta.current[targetId] = {
+              ...parsed,
+              receivedSize: 0,
+              nextChunkIndex: 0,
+            };
             fileChunks.current[targetId] = [];
 
             // 清理旧的状态消息
@@ -396,22 +400,28 @@ export default function App() {
             addMessage(targetId, {
               sender: "them",
               type: "receiving",
-              content: meta.name,
-              size: meta.size,
+              content: parsed.name,
+              size: parsed.size,
               progress: 0,
               messageId: messageId,
               timestamp: new Date().toISOString(),
             });
+          } else if (parsed.type === "chunk-index") {
+            // 记录期望的块索引
+            fileMeta.current[targetId].expectedIndex = parsed.index;
           }
         } catch (e) {
-          console.error("Failed to parse meta data", e);
+          console.error("Failed to parse string data", e);
         }
       } else {
         // 二进制数据 (文件块)
         if (!fileMeta.current[targetId]) return;
 
         const chunk = data;
-        fileChunks.current[targetId].push(chunk);
+        const expectedIndex = fileMeta.current[targetId].expectedIndex;
+
+        // 按索引存储块
+        fileChunks.current[targetId][expectedIndex] = chunk;
         fileMeta.current[targetId].receivedSize += chunk.byteLength;
 
         const { name, size, receivedSize, fileType } =
@@ -427,7 +437,11 @@ export default function App() {
 
         // 文件接收完成
         if (receivedSize >= size) {
-          const blob = new Blob(fileChunks.current[targetId], {
+          // 按顺序组装 Blob
+          const orderedChunks = fileChunks.current[targetId].filter(
+            (c) => c !== undefined,
+          );
+          const blob = new Blob(orderedChunks, {
             type: fileType,
           });
           const url = URL.createObjectURL(blob);
@@ -617,7 +631,12 @@ export default function App() {
       const reader = new FileReader();
 
       reader.onload = (e) => {
+        // 根据偏移量计算块索引，确保顺序正确
+        const currentIndex = Math.floor(chunkOffset / chunkSize);
+        // 先发送块索引，再发送二进制数据
+        dc.send(JSON.stringify({ type: "chunk-index", index: currentIndex }));
         dc.send(e.target.result);
+
         const newOffset = chunkOffset + e.target.result.byteLength;
 
         // 更新进度（使用原子操作）
@@ -847,15 +866,7 @@ export default function App() {
 
   const formatFileName = (name, maxLength = 20) => {
     if (name.length <= maxLength) return name;
-    const extIndex = name.lastIndexOf(".");
-    if (extIndex === -1) {
-      return name.slice(0, maxLength - 3) + "...";
-    }
-    const ext = name.slice(extIndex);
-    const baseName = name.slice(0, extIndex);
-    const maxBaseLen = maxLength - ext.length - 3;
-    if (maxBaseLen <= 0) return "..." + ext;
-    return baseName.slice(0, maxBaseLen) + "..." + ext;
+    return name.slice(0, 3) + "..." + name.slice(-3);
   };
 
   const handleUpdateUsername = () => {
