@@ -480,218 +480,225 @@ export default function App() {
   };
 
   const initiateFileTransfer = async (targetId, file) => {
-    let pc = peerConnections.current[targetId];
-    let dc = dataChannels.current[targetId];
+    return new Promise(async (resolve, reject) => {
+      let pc = peerConnections.current[targetId];
+      let dc = dataChannels.current[targetId];
 
-    if (!pc) {
-      pc = createPeerConnection(targetId);
-      dc = pc.createDataChannel("file-transfer");
-      setupDataChannel(targetId, dc);
+      if (!pc) {
+        pc = createPeerConnection(targetId);
+        dc = pc.createDataChannel("file-transfer");
+        setupDataChannel(targetId, dc);
 
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket.emit("offer", { target: targetId, sdp: offer });
-    } else if (!dc) {
-      // 这种情况理论上少见，通常伴随 PC 创建
-      dc = pc.createDataChannel("file-transfer");
-      setupDataChannel(targetId, dc);
-    }
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit("offer", { target: targetId, sdp: offer });
+      } else if (!dc) {
+        // 这种情况理论上少见，通常伴随 PC 创建
+        dc = pc.createDataChannel("file-transfer");
+        setupDataChannel(targetId, dc);
+      }
 
-    // 等待 DataChannel 开启
-    if (dc.readyState !== "open") {
-      addMessage(targetId, {
-        sender: "system",
-        type: "info",
-        content: "正在建立连接，请稍候...",
-        timestamp: new Date().toISOString(),
-      });
-      await new Promise((resolve) => {
-        dc.onopen = () => {
-          console.log("Channel opened late");
-          // 连接成功，移除 "正在建立连接" 消息
-          removeInfoMessages(targetId);
-          resolve();
-        };
-        // 简单的超时处理
-        setTimeout(() => {
-          resolve();
-        }, 5000);
-      });
-    }
-
-    if (dc.readyState !== "open") {
-      // 连接失败，先清理之前的消息，再显示失败
-      removeInfoMessages(targetId);
-      addMessage(targetId, {
-        sender: "system",
-        type: "error",
-        content: "连接建立失败，请重试",
-        timestamp: new Date().toISOString(),
-      });
-      return;
-    }
-
-    // 连接已建立，清理可能存在的旧状态消息
-    removeInfoMessages(targetId);
-
-    // 创建消息 ID 用于追踪
-    const messageId = `sending-${Date.now()}`;
-
-    // 初始化传输状态
-    fileTransferState.current[targetId] = {
-      progress: 0,
-      cancelled: false,
-      messageId: messageId,
-    };
-
-    // 发送中提示（带进度条）
-    addMessage(targetId, {
-      sender: "me",
-      type: "sending",
-      content: file.name,
-      size: file.size,
-      progress: 0,
-      messageId: messageId,
-      timestamp: new Date().toISOString(),
-    });
-
-    // 发送元数据
-    const meta = {
-      type: "file-meta",
-      name: file.name,
-      size: file.size,
-      fileType: file.type,
-    };
-    dc.send(JSON.stringify(meta));
-
-    // 发送文件块 - 使用并发发送和流量控制
-    const chunkSize = 128 * 1024; // 128KB
-    const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024; // 2MB 缓冲区上限
-    const MAX_CONCURRENT_READS = 8; // 最多同时读取 8 个块
-    let offset = 0;
-    let activeReads = 0;
-    let completed = false;
-
-    const checkCompletion = () => {
-      if (completed) return;
-      if (offset >= file.size && activeReads === 0) {
-        completed = true;
-        // 发送完成，删除进度消息并添加文件消息
-        setMessages((prev) => {
-          const msgs = prev[targetId] || [];
-          const newMsgs = msgs.filter((msg) => msg.messageId !== messageId);
-          return {
-            ...prev,
-            [targetId]: newMsgs,
-          };
-        });
-
+      // 等待 DataChannel 开启
+      if (dc.readyState !== "open") {
         addMessage(targetId, {
-          sender: "me",
-          type: "file",
-          content: file.name,
-          size: file.size,
-          url: URL.createObjectURL(file), // 本地预览
+          sender: "system",
+          type: "info",
+          content: "正在建立连接，请稍候...",
           timestamp: new Date().toISOString(),
         });
-
-        // 清理传输状态
-        delete fileTransferState.current[targetId];
+        await new Promise((res) => {
+          dc.onopen = () => {
+            console.log("Channel opened late");
+            // 连接成功，移除 "正在建立连接" 消息
+            removeInfoMessages(targetId);
+            res();
+          };
+          // 简单的超时处理
+          setTimeout(() => {
+            res();
+          }, 5000);
+        });
       }
-    };
 
-    const sendChunk = (chunkOffset) => {
-      // 检查是否已取消
-      if (fileTransferState.current[targetId]?.cancelled) {
-        if (!completed) {
+      if (dc.readyState !== "open") {
+        // 连接失败，先清理之前的消息，再显示失败
+        removeInfoMessages(targetId);
+        addMessage(targetId, {
+          sender: "system",
+          type: "error",
+          content: "连接建立失败，请重试",
+          timestamp: new Date().toISOString(),
+        });
+        reject(new Error("连接建立失败"));
+        return;
+      }
+
+      // 连接已建立，清理可能存在的旧状态消息
+      removeInfoMessages(targetId);
+
+      // 创建消息 ID 用于追踪
+      const messageId = `sending-${Date.now()}`;
+
+      // 初始化传输状态
+      fileTransferState.current[targetId] = {
+        progress: 0,
+        cancelled: false,
+        messageId: messageId,
+      };
+
+      // 发送中提示（带进度条）
+      addMessage(targetId, {
+        sender: "me",
+        type: "sending",
+        content: file.name,
+        size: file.size,
+        progress: 0,
+        messageId: messageId,
+        timestamp: new Date().toISOString(),
+      });
+
+      // 发送元数据
+      const meta = {
+        type: "file-meta",
+        name: file.name,
+        size: file.size,
+        fileType: file.type,
+      };
+      dc.send(JSON.stringify(meta));
+
+      // 发送文件块 - 使用并发发送和流量控制
+      const chunkSize = 128 * 1024; // 128KB
+      const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024; // 2MB 缓冲区上限
+      const MAX_CONCURRENT_READS = 8; // 最多同时读取 8 个块
+      let offset = 0;
+      let activeReads = 0;
+      let completed = false;
+
+      const checkCompletion = () => {
+        if (completed) return;
+        if (offset >= file.size && activeReads === 0) {
           completed = true;
-          removeInfoMessages(targetId);
+          // 发送完成，删除进度消息并添加文件消息
+          setMessages((prev) => {
+            const msgs = prev[targetId] || [];
+            const newMsgs = msgs.filter((msg) => msg.messageId !== messageId);
+            return {
+              ...prev,
+              [targetId]: newMsgs,
+            };
+          });
+
           addMessage(targetId, {
-            sender: "system",
-            type: "error",
-            content: "文件发送已取消",
+            sender: "me",
+            type: "file",
+            content: file.name,
+            size: file.size,
+            url: URL.createObjectURL(file), // 本地预览
             timestamp: new Date().toISOString(),
           });
+
+          // 清理传输状态
           delete fileTransferState.current[targetId];
-        }
-        return;
-      }
 
-      // 检查缓冲区，如果数据堆积则等待
-      if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-        setTimeout(() => sendChunk(chunkOffset), 10);
-        return;
-      }
-
-      // 读取文件块
-      const slice = file.slice(
-        chunkOffset,
-        Math.min(chunkOffset + chunkSize, file.size),
-      );
-      const reader = new FileReader();
-
-      reader.onload = (e) => {
-        // 根据偏移量计算块索引，确保顺序正确
-        const currentIndex = Math.floor(chunkOffset / chunkSize);
-        // 先发送块索引，再发送二进制数据
-        dc.send(JSON.stringify({ type: "chunk-index", index: currentIndex }));
-        dc.send(e.target.result);
-
-        const newOffset = chunkOffset + e.target.result.byteLength;
-
-        // 更新进度（使用原子操作）
-        const currentOffset = Math.max(offset, newOffset);
-        offset = currentOffset;
-        const progress = Math.round((currentOffset / file.size) * 100);
-        fileTransferState.current[targetId].progress = progress;
-
-        // 更新 UI 进度
-        updateMessageProgress(targetId, messageId, progress);
-
-        // 减少活跃读取数
-        activeReads--;
-
-        // 检查是否完成
-        checkCompletion();
-
-        // 如果还有数据要发送，启动新的读取
-        if (offset < file.size) {
-          scheduleNextChunk();
+          // 文件传输完成，resolve Promise
+          resolve();
         }
       };
 
-      reader.onerror = () => {
-        activeReads--;
-        console.error("Failed to read file chunk at offset:", chunkOffset);
-        // 即使读取失败也尝试继续
-        if (offset < file.size) {
-          scheduleNextChunk();
+      const sendChunk = (chunkOffset) => {
+        // 检查是否已取消
+        if (fileTransferState.current[targetId]?.cancelled) {
+          if (!completed) {
+            completed = true;
+            removeInfoMessages(targetId);
+            addMessage(targetId, {
+              sender: "system",
+              type: "error",
+              content: "文件发送已取消",
+              timestamp: new Date().toISOString(),
+            });
+            delete fileTransferState.current[targetId];
+            reject(new Error("文件发送已取消"));
+          }
+          return;
         }
+
+        // 检查缓冲区，如果数据堆积则等待
+        if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+          setTimeout(() => sendChunk(chunkOffset), 10);
+          return;
+        }
+
+        // 读取文件块
+        const slice = file.slice(
+          chunkOffset,
+          Math.min(chunkOffset + chunkSize, file.size),
+        );
+        const reader = new FileReader();
+
+        reader.onload = (e) => {
+          // 根据偏移量计算块索引，确保顺序正确
+          const currentIndex = Math.floor(chunkOffset / chunkSize);
+          // 先发送块索引，再发送二进制数据
+          dc.send(JSON.stringify({ type: "chunk-index", index: currentIndex }));
+          dc.send(e.target.result);
+
+          const newOffset = chunkOffset + e.target.result.byteLength;
+
+          // 更新进度（使用原子操作）
+          const currentOffset = Math.max(offset, newOffset);
+          offset = currentOffset;
+          const progress = Math.round((currentOffset / file.size) * 100);
+          fileTransferState.current[targetId].progress = progress;
+
+          // 更新 UI 进度
+          updateMessageProgress(targetId, messageId, progress);
+
+          // 减少活跃读取数
+          activeReads--;
+
+          // 检查是否完成
+          checkCompletion();
+
+          // 如果还有数据要发送，启动新的读取
+          if (offset < file.size) {
+            scheduleNextChunk();
+          }
+        };
+
+        reader.onerror = () => {
+          activeReads--;
+          console.error("Failed to read file chunk at offset:", chunkOffset);
+          // 即使读取失败也尝试继续
+          if (offset < file.size) {
+            scheduleNextChunk();
+          }
+        };
+
+        activeReads++;
+        reader.readAsArrayBuffer(slice);
       };
 
-      activeReads++;
-      reader.readAsArrayBuffer(slice);
-    };
+      const scheduleNextChunk = () => {
+        // 检查是否已取消
+        if (fileTransferState.current[targetId]?.cancelled) return;
 
-    const scheduleNextChunk = () => {
-      // 检查是否已取消
-      if (fileTransferState.current[targetId]?.cancelled) return;
+        // 如果达到并发上限或没有更多数据，等待
+        if (activeReads >= MAX_CONCURRENT_READS || offset >= file.size) return;
 
-      // 如果达到并发上限或没有更多数据，等待
-      if (activeReads >= MAX_CONCURRENT_READS || offset >= file.size) return;
+        // 获取下一个偏移量
+        const chunkOffset = offset;
+        offset += chunkSize;
 
-      // 获取下一个偏移量
-      const chunkOffset = offset;
-      offset += chunkSize;
+        // 发送下一个块
+        sendChunk(chunkOffset);
+      };
 
-      // 发送下一个块
-      sendChunk(chunkOffset);
-    };
-
-    // 启动初始的并发读取
-    for (let i = 0; i < MAX_CONCURRENT_READS; i++) {
-      scheduleNextChunk();
-    }
+      // 启动初始的并发读取
+      for (let i = 0; i < MAX_CONCURRENT_READS; i++) {
+        scheduleNextChunk();
+      }
+    });
   };
 
   const cancelFileTransfer = (targetId) => {
@@ -849,10 +856,16 @@ export default function App() {
     }
   };
 
-  const handleFileSelect = (e) => {
-    const file = e.target.files[0];
-    if (file && selectedUser) {
-      initiateFileTransfer(selectedUser.id, file);
+  const handleFileSelect = async (e) => {
+    const files = Array.from(e.target.files);
+    if (files.length > 0 && selectedUser) {
+      // 清空 input，允许重复选择相同文件
+      e.target.value = '';
+
+      // 依次发送每个文件
+      for (const file of files) {
+        await initiateFileTransfer(selectedUser.id, file);
+      }
     }
   };
 
@@ -1404,6 +1417,7 @@ export default function App() {
                   <Paperclip size={22} />
                   <input
                     type="file"
+                    multiple
                     className="hidden"
                     onChange={handleFileSelect}
                   />
