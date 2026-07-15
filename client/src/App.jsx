@@ -374,23 +374,19 @@ export default function App() {
       const data = event.data;
 
       if (typeof data === "string") {
-        // 可能是文件元数据或块索引
         try {
           const parsed = JSON.parse(data);
           if (parsed.type === "file-meta") {
             fileMeta.current[targetId] = {
               ...parsed,
               receivedSize: 0,
-              nextChunkIndex: 0,
             };
             fileChunks.current[targetId] = [];
 
-            // 清理旧的状态消息
             removeInfoMessages(targetId);
 
             const messageId = `receiving-${Date.now()}`;
 
-            // 创建接收方的传输状态
             fileTransferState.current[targetId] = {
               progress: 0,
               cancelled: false,
@@ -406,74 +402,70 @@ export default function App() {
               messageId: messageId,
               timestamp: new Date().toISOString(),
             });
-          } else if (parsed.type === "chunk-index") {
-            // 记录期望的块索引
-            fileMeta.current[targetId].expectedIndex = parsed.index;
+          } else if (parsed.type === "file-end") {
+            const meta = fileMeta.current[targetId];
+            const transferState = fileTransferState.current[targetId];
+
+            if (!meta) return;
+
+            if (meta.receivedSize >= meta.size) {
+              const blob = new Blob(fileChunks.current[targetId], {
+                type: meta.fileType,
+              });
+              const url = URL.createObjectURL(blob);
+
+              const receivingMessageId = transferState?.messageId;
+              if (receivingMessageId) {
+                setMessages((prev) => {
+                  const msgs = prev[targetId] || [];
+                  const newMsgs = msgs.filter(
+                    (msg) => msg.messageId !== receivingMessageId,
+                  );
+                  return {
+                    ...prev,
+                    [targetId]: newMsgs,
+                  };
+                });
+              }
+
+              addMessage(targetId, {
+                sender: "them",
+                type: "file",
+                content: meta.name,
+                url: url,
+                size: meta.size,
+                timestamp: new Date().toISOString(),
+              });
+            } else {
+              addMessage(targetId, {
+                sender: "system",
+                type: "error",
+                content: `文件接收不完整 (${meta.receivedSize}/${meta.size})`,
+                timestamp: new Date().toISOString(),
+              });
+            }
+
+            fileChunks.current[targetId] = [];
+            fileMeta.current[targetId] = null;
+            delete fileTransferState.current[targetId];
           }
         } catch (e) {
           console.error("Failed to parse string data", e);
         }
       } else {
-        // 二进制数据 (文件块)
         if (!fileMeta.current[targetId]) return;
 
         const chunk = data;
-        const expectedIndex = fileMeta.current[targetId].expectedIndex;
-
-        // 按索引存储块
-        fileChunks.current[targetId][expectedIndex] = chunk;
+        fileChunks.current[targetId].push(chunk);
         fileMeta.current[targetId].receivedSize += chunk.byteLength;
 
-        const { name, size, receivedSize, fileType } =
-          fileMeta.current[targetId];
+        const { size, receivedSize } = fileMeta.current[targetId];
         const transferState = fileTransferState.current[targetId];
 
-        // 更新进度
         const progress = Math.round((receivedSize / size) * 100);
         if (transferState) {
           transferState.progress = progress;
           updateReceivingProgress(targetId, transferState.messageId, progress);
-        }
-
-        // 文件接收完成
-        if (receivedSize >= size) {
-          // 按顺序组装 Blob
-          const orderedChunks = fileChunks.current[targetId].filter(
-            (c) => c !== undefined,
-          );
-          const blob = new Blob(orderedChunks, {
-            type: fileType,
-          });
-          const url = URL.createObjectURL(blob);
-
-          // 接收完成后，删除进度消息并添加文件消息
-          const receivingMessageId = transferState?.messageId;
-          if (receivingMessageId) {
-            setMessages((prev) => {
-              const msgs = prev[targetId] || [];
-              const newMsgs = msgs.filter(
-                (msg) => msg.messageId !== receivingMessageId,
-              );
-              return {
-                ...prev,
-                [targetId]: newMsgs,
-              };
-            });
-          }
-
-          addMessage(targetId, {
-            sender: "them",
-            type: "file",
-            content: name,
-            url: url,
-            size: size,
-            timestamp: new Date().toISOString(),
-          });
-
-          // 清理
-          fileChunks.current[targetId] = [];
-          fileMeta.current[targetId] = null;
-          delete fileTransferState.current[targetId];
         }
       }
     };
@@ -557,7 +549,6 @@ export default function App() {
         timestamp: new Date().toISOString(),
       });
 
-      // 发送元数据
       const meta = {
         type: "file-meta",
         name: file.name,
@@ -566,138 +557,97 @@ export default function App() {
       };
       dc.send(JSON.stringify(meta));
 
-      // 发送文件块 - 使用并发发送和流量控制
-      const chunkSize = 128 * 1024; // 128KB
-      const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024; // 2MB 缓冲区上限
-      const MAX_CONCURRENT_READS = 8; // 最多同时读取 8 个块
+      const chunkSize = 256 * 1024;
+      const MAX_BUFFERED_AMOUNT = 4 * 1024 * 1024;
+      dc.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT / 2;
+
       let offset = 0;
-      let activeReads = 0;
-      let completed = false;
+      let nextSlicePromise = null;
+      let nextOffset = 0;
 
-      const checkCompletion = () => {
-        if (completed) return;
-        if (offset >= file.size && activeReads === 0) {
-          completed = true;
-          // 发送完成，删除进度消息并添加文件消息
-          setMessages((prev) => {
-            const msgs = prev[targetId] || [];
-            const newMsgs = msgs.filter((msg) => msg.messageId !== messageId);
-            return {
-              ...prev,
-              [targetId]: newMsgs,
-            };
-          });
+      const waitForBuffer = () => {
+        return new Promise((res) => {
+          if (dc.bufferedAmount <= MAX_BUFFERED_AMOUNT) {
+            res();
+            return;
+          }
+          const onLow = () => {
+            dc.removeEventListener("bufferedamountlow", onLow);
+            res();
+          };
+          dc.addEventListener("bufferedamountlow", onLow);
+        });
+      };
 
+      const prefetchNext = () => {
+        if (nextOffset >= file.size) {
+          nextSlicePromise = null;
+          return;
+        }
+        const slice = file.slice(
+          nextOffset,
+          Math.min(nextOffset + chunkSize, file.size),
+        );
+        nextSlicePromise = slice.arrayBuffer();
+        nextOffset += chunkSize;
+      };
+
+      prefetchNext();
+
+      while (offset < file.size) {
+        if (fileTransferState.current[targetId]?.cancelled) {
+          removeInfoMessages(targetId);
           addMessage(targetId, {
-            sender: "me",
-            type: "file",
-            content: file.name,
-            size: file.size,
-            url: URL.createObjectURL(file), // 本地预览
+            sender: "system",
+            type: "error",
+            content: "文件发送已取消",
             timestamp: new Date().toISOString(),
           });
-
-          // 清理传输状态
           delete fileTransferState.current[targetId];
-
-          // 文件传输完成，resolve Promise
-          resolve();
-        }
-      };
-
-      const sendChunk = (chunkOffset) => {
-        // 检查是否已取消
-        if (fileTransferState.current[targetId]?.cancelled) {
-          if (!completed) {
-            completed = true;
-            removeInfoMessages(targetId);
-            addMessage(targetId, {
-              sender: "system",
-              type: "error",
-              content: "文件发送已取消",
-              timestamp: new Date().toISOString(),
-            });
-            delete fileTransferState.current[targetId];
-            reject(new Error("文件发送已取消"));
-          }
+          reject(new Error("文件发送已取消"));
           return;
         }
 
-        // 检查缓冲区，如果数据堆积则等待
-        if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-          setTimeout(() => sendChunk(chunkOffset), 10);
-          return;
-        }
+        await waitForBuffer();
 
-        // 读取文件块
-        const slice = file.slice(
-          chunkOffset,
-          Math.min(chunkOffset + chunkSize, file.size),
+        const currentSlice = file.slice(
+          offset,
+          Math.min(offset + chunkSize, file.size),
         );
-        const reader = new FileReader();
+        const arrayBuffer = await currentSlice.arrayBuffer();
 
-        reader.onload = (e) => {
-          // 根据偏移量计算块索引，确保顺序正确
-          const currentIndex = Math.floor(chunkOffset / chunkSize);
-          // 先发送块索引，再发送二进制数据
-          dc.send(JSON.stringify({ type: "chunk-index", index: currentIndex }));
-          dc.send(e.target.result);
+        dc.send(arrayBuffer);
 
-          const newOffset = chunkOffset + e.target.result.byteLength;
-
-          // 更新进度（使用原子操作）
-          const currentOffset = Math.max(offset, newOffset);
-          offset = currentOffset;
-          const progress = Math.round((currentOffset / file.size) * 100);
-          fileTransferState.current[targetId].progress = progress;
-
-          // 更新 UI 进度
-          updateMessageProgress(targetId, messageId, progress);
-
-          // 减少活跃读取数
-          activeReads--;
-
-          // 检查是否完成
-          checkCompletion();
-
-          // 如果还有数据要发送，启动新的读取
-          if (offset < file.size) {
-            scheduleNextChunk();
-          }
-        };
-
-        reader.onerror = () => {
-          activeReads--;
-          console.error("Failed to read file chunk at offset:", chunkOffset);
-          // 即使读取失败也尝试继续
-          if (offset < file.size) {
-            scheduleNextChunk();
-          }
-        };
-
-        activeReads++;
-        reader.readAsArrayBuffer(slice);
-      };
-
-      const scheduleNextChunk = () => {
-        // 检查是否已取消
-        if (fileTransferState.current[targetId]?.cancelled) return;
-
-        // 如果达到并发上限或没有更多数据，等待
-        if (activeReads >= MAX_CONCURRENT_READS || offset >= file.size) return;
-
-        // 获取下一个偏移量
-        const chunkOffset = offset;
-        offset += chunkSize;
-
-        // 发送下一个块
-        sendChunk(chunkOffset);
-      };
-
-      // 启动初始的并发读取
-      for (let i = 0; i < MAX_CONCURRENT_READS; i++) {
-        scheduleNextChunk();
+        offset += arrayBuffer.byteLength;
+        const progress = Math.round((offset / file.size) * 100);
+        fileTransferState.current[targetId].progress = progress;
+        updateMessageProgress(targetId, messageId, progress);
       }
+
+      await waitForBuffer();
+
+      dc.send(JSON.stringify({ type: "file-end" }));
+
+      setMessages((prev) => {
+        const msgs = prev[targetId] || [];
+        const newMsgs = msgs.filter((msg) => msg.messageId !== messageId);
+        return {
+          ...prev,
+          [targetId]: newMsgs,
+        };
+      });
+
+      addMessage(targetId, {
+        sender: "me",
+        type: "file",
+        content: file.name,
+        size: file.size,
+        url: URL.createObjectURL(file),
+        timestamp: new Date().toISOString(),
+      });
+
+      delete fileTransferState.current[targetId];
+      resolve();
     });
   };
 
