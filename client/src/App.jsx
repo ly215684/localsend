@@ -14,6 +14,7 @@ import {
   Plus,
   Hash,
   X,
+  Settings,
 } from "lucide-react";
 import { clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
@@ -145,11 +146,21 @@ export default function App() {
   const [inputText, setInputText] = useState("");
   const [isMobileView, setIsMobileView] = useState(window.innerWidth < 768);
 
+  const [numChannels, setNumChannels] = useState(() => {
+    const saved = localStorage.getItem("numChannels");
+    return saved ? parseInt(saved, 10) : 4;
+  });
+  const [showSettings, setShowSettings] = useState(false);
+
+  useEffect(() => {
+    localStorage.setItem("numChannels", numChannels.toString());
+  }, [numChannels]);
+
   // WebRTC Refs
   const peerConnections = useRef({}); // { userId: RTCPeerConnection }
-  const dataChannels = useRef({}); // { userId: RTCDataChannel }
-  const fileChunks = useRef({}); // { userId: [ArrayBuffer, ...] }
-  const fileMeta = useRef({}); // { userId: { name, size, type, receivedSize } }
+  const dataChannels = useRef({}); // { userId: [RTCDataChannel, ...] }
+  const fileChunks = useRef({}); // { userId: { channelIndex: [ArrayBuffer, ...] } }
+  const fileMeta = useRef({}); // { userId: { name, size, type, numChannels, channels: [{ receivedSize: 0, done: false }, ...] } }
   const pendingCandidates = useRef({}); // { userId: [RTCIceCandidate, ...] }
   const fileTransferState = useRef({}); // { userId: { progress: number, cancelled: boolean, messageId: string } }
 
@@ -344,7 +355,7 @@ export default function App() {
       return peerConnections.current[targetId];
 
     const pc = new RTCPeerConnection({
-      iceServers: [], // 仅使用局域网 Host Candidate，不使用 STUN
+      iceServers: [],
     });
 
     pc.onicecandidate = (event) => {
@@ -357,18 +368,110 @@ export default function App() {
     };
 
     pc.ondatachannel = (event) => {
-      setupDataChannel(targetId, event.channel);
+      const channelIndex = event.channel.id - 10;
+      setupDataChannel(targetId, event.channel, channelIndex);
     };
+
+    const channels = [];
+    for (let i = 0; i < numChannels; i++) {
+      const dc = pc.createDataChannel(`file-transfer-${i}`, {
+        negotiated: true,
+        id: 10 + i,
+      });
+      setupDataChannel(targetId, dc, i);
+      channels.push(dc);
+    }
+    dataChannels.current[targetId] = channels;
 
     peerConnections.current[targetId] = pc;
     return pc;
   };
 
-  const setupDataChannel = (targetId, channel) => {
-    dataChannels.current[targetId] = channel;
+  const checkAllChannelsDone = (targetId) => {
+    const meta = fileMeta.current[targetId];
+    if (!meta) return;
 
-    channel.onopen = () => console.log(`Data channel with ${targetId} opened`);
-    channel.onclose = () => console.log(`Data channel with ${targetId} closed`);
+    const allDone = meta.channels.every((ch) => ch.done);
+    if (!allDone) return;
+
+    const totalReceived = meta.channels.reduce(
+      (sum, ch) => sum + ch.receivedSize,
+      0,
+    );
+
+    if (totalReceived >= meta.size) {
+      const allChunks = [];
+      for (let i = 0; i < meta.numChannels; i++) {
+        if (fileChunks.current[targetId][i]) {
+          allChunks.push(...fileChunks.current[targetId][i]);
+        }
+      }
+      const blob = new Blob(allChunks, {
+        type: meta.fileType,
+      });
+      const url = URL.createObjectURL(blob);
+
+      const transferState = fileTransferState.current[targetId];
+      const receivingMessageId = transferState?.messageId;
+      if (receivingMessageId) {
+        setMessages((prev) => {
+          const msgs = prev[targetId] || [];
+          const newMsgs = msgs.filter(
+            (msg) => msg.messageId !== receivingMessageId,
+          );
+          return {
+            ...prev,
+            [targetId]: newMsgs,
+          };
+        });
+      }
+
+      addMessage(targetId, {
+        sender: "them",
+        type: "file",
+        content: meta.name,
+        url: url,
+        size: meta.size,
+        timestamp: new Date().toISOString(),
+      });
+    } else {
+      addMessage(targetId, {
+        sender: "system",
+        type: "error",
+        content: `文件接收不完整 (${totalReceived}/${meta.size})`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    fileChunks.current[targetId] = {};
+    fileMeta.current[targetId] = null;
+    delete fileTransferState.current[targetId];
+  };
+
+  const setupDataChannel = (targetId, channel, channelIndex) => {
+    if (!dataChannels.current[targetId]) {
+      dataChannels.current[targetId] = [];
+    }
+    dataChannels.current[targetId][channelIndex] = channel;
+
+    channel.onopen = () =>
+      console.log(`Data channel ${channelIndex} with ${targetId} opened`);
+    channel.onclose = () => {
+      console.log(`Data channel ${channelIndex} with ${targetId} closed`);
+      const meta = fileMeta.current[targetId];
+      if (meta && !meta.channels[channelIndex]?.done) {
+        meta.channels[channelIndex].done = true;
+        checkAllChannelsDone(targetId);
+      }
+    };
+    channel.onerror = (error) => {
+      console.error(`Data channel ${channelIndex} error:`, error);
+      const meta = fileMeta.current[targetId];
+      if (meta && !meta.channels[channelIndex]?.done) {
+        meta.channels[channelIndex].done = true;
+        checkAllChannelsDone(targetId);
+      }
+    };
 
     channel.onmessage = (event) => {
       const data = event.data;
@@ -377,11 +480,15 @@ export default function App() {
         try {
           const parsed = JSON.parse(data);
           if (parsed.type === "file-meta") {
+            const channels = [];
+            for (let i = 0; i < parsed.numChannels; i++) {
+              channels.push({ receivedSize: 0, done: false });
+            }
             fileMeta.current[targetId] = {
               ...parsed,
-              receivedSize: 0,
+              channels,
             };
-            fileChunks.current[targetId] = [];
+            fileChunks.current[targetId] = {};
 
             removeInfoMessages(targetId);
 
@@ -402,50 +509,24 @@ export default function App() {
               messageId: messageId,
               timestamp: new Date().toISOString(),
             });
-          } else if (parsed.type === "file-end") {
+          } else if (parsed.type === "channel-end") {
             const meta = fileMeta.current[targetId];
-            const transferState = fileTransferState.current[targetId];
-
             if (!meta) return;
 
-            if (meta.receivedSize >= meta.size) {
-              const blob = new Blob(fileChunks.current[targetId], {
-                type: meta.fileType,
-              });
-              const url = URL.createObjectURL(blob);
+            meta.channels[parsed.channelIndex].done = true;
+            checkAllChannelsDone(targetId);
+          } else if (parsed.type === "transfer-timeout") {
+            const meta = fileMeta.current[targetId];
+            if (!meta) return;
 
-              const receivingMessageId = transferState?.messageId;
-              if (receivingMessageId) {
-                setMessages((prev) => {
-                  const msgs = prev[targetId] || [];
-                  const newMsgs = msgs.filter(
-                    (msg) => msg.messageId !== receivingMessageId,
-                  );
-                  return {
-                    ...prev,
-                    [targetId]: newMsgs,
-                  };
-                });
-              }
+            addMessage(targetId, {
+              sender: "system",
+              type: "error",
+              content: "文件传输超时",
+              timestamp: new Date().toISOString(),
+            });
 
-              addMessage(targetId, {
-                sender: "them",
-                type: "file",
-                content: meta.name,
-                url: url,
-                size: meta.size,
-                timestamp: new Date().toISOString(),
-              });
-            } else {
-              addMessage(targetId, {
-                sender: "system",
-                type: "error",
-                content: `文件接收不完整 (${meta.receivedSize}/${meta.size})`,
-                timestamp: new Date().toISOString(),
-              });
-            }
-
-            fileChunks.current[targetId] = [];
+            fileChunks.current[targetId] = {};
             fileMeta.current[targetId] = null;
             delete fileTransferState.current[targetId];
           }
@@ -453,16 +534,23 @@ export default function App() {
           console.error("Failed to parse string data", e);
         }
       } else {
-        if (!fileMeta.current[targetId]) return;
+        const meta = fileMeta.current[targetId];
+        if (!meta) return;
 
         const chunk = data;
-        fileChunks.current[targetId].push(chunk);
-        fileMeta.current[targetId].receivedSize += chunk.byteLength;
+        if (!fileChunks.current[targetId][channelIndex]) {
+          fileChunks.current[targetId][channelIndex] = [];
+        }
+        fileChunks.current[targetId][channelIndex].push(chunk);
+        meta.channels[channelIndex].receivedSize += chunk.byteLength;
 
-        const { size, receivedSize } = fileMeta.current[targetId];
+        const totalReceived = meta.channels.reduce(
+          (sum, ch) => sum + ch.receivedSize,
+          0,
+        );
         const transferState = fileTransferState.current[targetId];
 
-        const progress = Math.round((receivedSize / size) * 100);
+        const progress = Math.round((totalReceived / meta.size) * 100);
         if (transferState) {
           transferState.progress = progress;
           updateReceivingProgress(targetId, transferState.messageId, progress);
@@ -474,46 +562,48 @@ export default function App() {
   const initiateFileTransfer = async (targetId, file) => {
     return new Promise(async (resolve, reject) => {
       let pc = peerConnections.current[targetId];
-      let dc = dataChannels.current[targetId];
+      let channels = dataChannels.current[targetId];
 
-      if (!pc) {
+      if (!pc || !channels || channels.length !== numChannels) {
+        if (pc) {
+          pc.close();
+          delete peerConnections.current[targetId];
+          delete dataChannels.current[targetId];
+        }
         pc = createPeerConnection(targetId);
-        dc = pc.createDataChannel("file-transfer");
-        setupDataChannel(targetId, dc);
+        channels = dataChannels.current[targetId];
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         socket.emit("offer", { target: targetId, sdp: offer });
-      } else if (!dc) {
-        // 这种情况理论上少见，通常伴随 PC 创建
-        dc = pc.createDataChannel("file-transfer");
-        setupDataChannel(targetId, dc);
       }
 
-      // 等待 DataChannel 开启
-      if (dc.readyState !== "open") {
-        addMessage(targetId, {
-          sender: "system",
-          type: "info",
-          content: "正在建立连接，请稍候...",
-          timestamp: new Date().toISOString(),
-        });
-        await new Promise((res) => {
-          dc.onopen = () => {
-            console.log("Channel opened late");
-            // 连接成功，移除 "正在建立连接" 消息
-            removeInfoMessages(targetId);
-            res();
-          };
-          // 简单的超时处理
-          setTimeout(() => {
-            res();
-          }, 5000);
-        });
-      }
+      const waitForChannels = async () => {
+        const openPromises = channels.map(
+          (dc) =>
+            new Promise((res) => {
+              if (dc.readyState === "open") {
+                res();
+                return;
+              }
+              dc.onopen = () => res();
+              setTimeout(() => res(), 5000);
+            }),
+        );
+        await Promise.all(openPromises);
+      };
 
-      if (dc.readyState !== "open") {
-        // 连接失败，先清理之前的消息，再显示失败
+      addMessage(targetId, {
+        sender: "system",
+        type: "info",
+        content: "正在建立连接，请稍候...",
+        timestamp: new Date().toISOString(),
+      });
+
+      await waitForChannels();
+
+      const allOpen = channels.every((dc) => dc.readyState === "open");
+      if (!allOpen) {
         removeInfoMessages(targetId);
         addMessage(targetId, {
           sender: "system",
@@ -525,20 +615,16 @@ export default function App() {
         return;
       }
 
-      // 连接已建立，清理可能存在的旧状态消息
       removeInfoMessages(targetId);
 
-      // 创建消息 ID 用于追踪
       const messageId = `sending-${Date.now()}`;
 
-      // 初始化传输状态
       fileTransferState.current[targetId] = {
         progress: 0,
         cancelled: false,
         messageId: messageId,
       };
 
-      // 发送中提示（带进度条）
       addMessage(targetId, {
         sender: "me",
         type: "sending",
@@ -554,79 +640,88 @@ export default function App() {
         name: file.name,
         size: file.size,
         fileType: file.type,
+        numChannels: numChannels,
       };
-      dc.send(JSON.stringify(meta));
+      channels[0].send(JSON.stringify(meta));
 
       const chunkSize = 256 * 1024;
-      const MAX_BUFFERED_AMOUNT = 4 * 1024 * 1024;
-      dc.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT / 2;
+      const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024;
 
-      let offset = 0;
-      let nextSlicePromise = null;
-      let nextOffset = 0;
+      const waitForBuffer = async (dc) => {
+        while (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+          await new Promise((res) => setTimeout(res, 50));
+        }
+      };
 
-      const waitForBuffer = () => {
-        return new Promise((res) => {
-          if (dc.bufferedAmount <= MAX_BUFFERED_AMOUNT) {
-            res();
-            return;
+      const totalBytesSent = { value: 0 };
+
+      const sendChannelData = async (channelIndex) => {
+        return new Promise(async (resolve) => {
+          const dc = channels[channelIndex];
+          dc.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT / 2;
+
+          const chunkPerChannel = Math.ceil(file.size / numChannels);
+          const startOffset = channelIndex * chunkPerChannel;
+          const endOffset =
+            channelIndex === numChannels - 1
+              ? file.size
+              : (channelIndex + 1) * chunkPerChannel;
+
+          console.log(`[sendChannelData] channel ${channelIndex}: start=${startOffset}, end=${endOffset}, chunkPerChannel=${chunkPerChannel}, file.size=${file.size}`);
+
+          let offset = startOffset;
+
+          while (offset < endOffset) {
+            console.log(`[sendChannelData] channel ${channelIndex}: offset=${offset}, endOffset=${endOffset}`);
+            
+            if (fileTransferState.current[targetId]?.cancelled) {
+              resolve();
+              return;
+            }
+
+            await waitForBuffer(dc);
+
+            const slice = file.slice(
+              offset,
+              Math.min(offset + chunkSize, endOffset),
+            );
+            const arrayBuffer = await slice.arrayBuffer();
+
+            dc.send(arrayBuffer);
+
+            offset += arrayBuffer.byteLength;
+            totalBytesSent.value += arrayBuffer.byteLength;
+
+            const progress = Math.round((Math.min(totalBytesSent.value, file.size) / file.size) * 100);
+            fileTransferState.current[targetId].progress = progress;
+            updateMessageProgress(targetId, messageId, progress);
+            
+            console.log(`[sendChannelData] channel ${channelIndex}: sent ${arrayBuffer.byteLength} bytes, total=${totalBytesSent.value}, progress=${progress}%`);
           }
-          const onLow = () => {
-            dc.removeEventListener("bufferedamountlow", onLow);
-            res();
-          };
-          dc.addEventListener("bufferedamountlow", onLow);
+
+          await waitForBuffer(dc);
+
+          dc.send(JSON.stringify({ type: "channel-end", channelIndex }));
+
+          while (dc.bufferedAmount > 0) {
+            await new Promise((res) => setTimeout(res, 50));
+          }
+
+          console.log(`[sendChannelData] channel ${channelIndex}: finished, sent ${totalBytesSent.value} total bytes`);
+          resolve();
         });
       };
 
-      const prefetchNext = () => {
-        if (nextOffset >= file.size) {
-          nextSlicePromise = null;
-          return;
-        }
-        const slice = file.slice(
-          nextOffset,
-          Math.min(nextOffset + chunkSize, file.size),
-        );
-        nextSlicePromise = slice.arrayBuffer();
-        nextOffset += chunkSize;
-      };
-
-      prefetchNext();
-
-      while (offset < file.size) {
-        if (fileTransferState.current[targetId]?.cancelled) {
-          removeInfoMessages(targetId);
-          addMessage(targetId, {
-            sender: "system",
-            type: "error",
-            content: "文件发送已取消",
-            timestamp: new Date().toISOString(),
-          });
-          delete fileTransferState.current[targetId];
-          reject(new Error("文件发送已取消"));
-          return;
-        }
-
-        await waitForBuffer();
-
-        const currentSlice = file.slice(
-          offset,
-          Math.min(offset + chunkSize, file.size),
-        );
-        const arrayBuffer = await currentSlice.arrayBuffer();
-
-        dc.send(arrayBuffer);
-
-        offset += arrayBuffer.byteLength;
-        const progress = Math.round((offset / file.size) * 100);
-        fileTransferState.current[targetId].progress = progress;
-        updateMessageProgress(targetId, messageId, progress);
+      const sendPromises = [];
+      for (let i = 0; i < numChannels; i++) {
+        sendPromises.push(sendChannelData(i));
       }
 
-      await waitForBuffer();
+      await Promise.all(sendPromises);
 
-      dc.send(JSON.stringify({ type: "file-end" }));
+      if (fileTransferState.current[targetId]?.cancelled) {
+        return;
+      }
 
       setMessages((prev) => {
         const msgs = prev[targetId] || [];
@@ -656,10 +751,10 @@ export default function App() {
     if (transferState) {
       transferState.cancelled = true;
 
-      // 关闭 data channel 以停止传输
-      const dc = dataChannels.current[targetId];
-      if (dc) {
-        dc.close();
+      // 关闭所有 data channel
+      const channels = dataChannels.current[targetId];
+      if (channels) {
+        channels.forEach((dc) => dc.close());
       }
 
       // 清理连接
@@ -911,6 +1006,18 @@ export default function App() {
                 <Edit2 size={12} />
               </button>
             </div>
+            <button
+              onClick={() => setShowSettings(!showSettings)}
+              className={cn(
+                "p-2 rounded-lg transition-all",
+                showSettings
+                  ? "bg-white/20 text-white"
+                  : "text-white/70 hover:text-white hover:bg-white/10",
+              )}
+              title="设置"
+            >
+              <Settings size={20} />
+            </button>
 
             {isEditingName ? (
               <div className="flex-1 flex items-center gap-2 animate-in fade-in zoom-in-95 duration-200">
@@ -953,7 +1060,47 @@ export default function App() {
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-2 scroll-smooth">
+        {showSettings && (
+            <div className="px-4 py-3 bg-gray-50 border-b border-gray-100 animate-in fade-in slide-in-from-top-2">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="font-bold text-gray-700 text-sm">设置</h3>
+                <button
+                  onClick={() => setShowSettings(false)}
+                  className="text-gray-400 hover:text-gray-600"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="space-y-3">
+                <div>
+                  <label className="text-xs font-medium text-gray-500 block mb-2">
+                    传输通道数
+                  </label>
+                  <div className="flex gap-2">
+                    {[1, 2, 4, 8].map((n) => (
+                      <button
+                        key={n}
+                        onClick={() => setNumChannels(n)}
+                        className={cn(
+                          "flex-1 py-2 text-sm font-medium rounded-lg transition-all",
+                          numChannels === n
+                            ? "bg-blue-600 text-white shadow-sm"
+                            : "bg-white text-gray-700 hover:bg-blue-50 border border-gray-200",
+                        )}
+                      >
+                        {n}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-xs text-gray-400 mt-2">
+                    更多通道可提升传输速度，但会占用更多系统资源。建议在局域网环境下使用 4-8 通道。
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="flex-1 overflow-y-auto p-2 scroll-smooth">
           {/* 公共聊天室入口 */}
           <div
             onClick={() => handleSelectUser(PUBLIC_ROOM_USER)}
