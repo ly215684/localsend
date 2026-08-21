@@ -498,6 +498,11 @@ export default function App() {
               progress: 0,
               cancelled: false,
               messageId: messageId,
+              startTime: Date.now(),
+              totalReceived: 0,
+              lastUpdateTime: Date.now(),
+              lastReceivedAtUpdate: 0,
+              smoothedSpeed: 0,
             };
 
             addMessage(targetId, {
@@ -553,7 +558,24 @@ export default function App() {
         const progress = Math.round((totalReceived / meta.size) * 100);
         if (transferState) {
           transferState.progress = progress;
-          updateReceivingProgress(targetId, transferState.messageId, progress);
+          transferState.totalReceived = totalReceived;
+          const now = Date.now();
+          const elapsed = (now - transferState.lastUpdateTime) / 1000;
+          if (elapsed > 0.15) {
+            const deltaBytes =
+              totalReceived - transferState.lastReceivedAtUpdate;
+            const instantSpeed = elapsed > 0 ? deltaBytes / elapsed : 0;
+            transferState.smoothedSpeed =
+              0.3 * instantSpeed + 0.7 * transferState.smoothedSpeed;
+            transferState.lastUpdateTime = now;
+            transferState.lastReceivedAtUpdate = totalReceived;
+          }
+          updateReceivingProgress(
+            targetId,
+            transferState.messageId,
+            progress,
+            transferState.smoothedSpeed,
+          );
         }
       }
     };
@@ -623,6 +645,11 @@ export default function App() {
         progress: 0,
         cancelled: false,
         messageId: messageId,
+        startTime: Date.now(),
+        totalSent: 0,
+        lastUpdateTime: Date.now(),
+        lastSentAtUpdate: 0,
+        smoothedSpeed: 0,
       };
 
       addMessage(targetId, {
@@ -693,9 +720,29 @@ export default function App() {
             totalBytesSent.value += arrayBuffer.byteLength;
 
             const progress = Math.round((Math.min(totalBytesSent.value, file.size) / file.size) * 100);
-            fileTransferState.current[targetId].progress = progress;
-            updateMessageProgress(targetId, messageId, progress);
-            
+            const transferState = fileTransferState.current[targetId];
+            if (transferState) {
+              transferState.progress = progress;
+              transferState.totalSent = totalBytesSent.value;
+              const now = Date.now();
+              const elapsed = (now - transferState.lastUpdateTime) / 1000;
+              if (elapsed > 0.15) {
+                const deltaBytes =
+                  totalBytesSent.value - transferState.lastSentAtUpdate;
+                const instantSpeed = elapsed > 0 ? deltaBytes / elapsed : 0;
+                transferState.smoothedSpeed =
+                  0.3 * instantSpeed + 0.7 * transferState.smoothedSpeed;
+                transferState.lastUpdateTime = now;
+                transferState.lastSentAtUpdate = totalBytesSent.value;
+              }
+              updateMessageProgress(
+                targetId,
+                messageId,
+                progress,
+                transferState.smoothedSpeed,
+              );
+            }
+
             console.log(`[sendChannelData] channel ${channelIndex}: sent ${arrayBuffer.byteLength} bytes, total=${totalBytesSent.value}, progress=${progress}%`);
           }
 
@@ -779,12 +826,12 @@ export default function App() {
     }
   };
 
-  const updateMessageProgress = (targetId, messageId, progress) => {
+  const updateMessageProgress = (targetId, messageId, progress, speed) => {
     setMessages((prev) => {
       const msgs = prev[targetId] || [];
       const newMsgs = msgs.map((msg) => {
         if (msg.messageId === messageId && msg.type === "sending") {
-          return { ...msg, progress };
+          return { ...msg, progress, speed };
         }
         return msg;
       });
@@ -795,12 +842,12 @@ export default function App() {
     });
   };
 
-  const updateReceivingProgress = (targetId, messageId, progress) => {
+  const updateReceivingProgress = (targetId, messageId, progress, speed) => {
     setMessages((prev) => {
       const msgs = prev[targetId] || [];
       const newMsgs = msgs.map((msg) => {
         if (msg.messageId === messageId && msg.type === "receiving") {
-          return { ...msg, progress };
+          return { ...msg, progress, speed };
         }
         return msg;
       });
@@ -920,6 +967,18 @@ export default function App() {
     const sizes = ["B", "KB", "MB", "GB"];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+  };
+
+  // 格式化传输速度
+  const formatSpeed = (bytesPerSecond) => {
+    if (!bytesPerSecond || bytesPerSecond <= 0 || !isFinite(bytesPerSecond))
+      return "0 B/s";
+    const k = 1024;
+    const sizes = ["B/s", "KB/s", "MB/s", "GB/s"];
+    const i = Math.floor(Math.log(bytesPerSecond) / Math.log(k));
+    return (
+      parseFloat((bytesPerSecond / Math.pow(k, i)).toFixed(2)) + " " + sizes[i]
+    );
   };
 
   const formatFileName = (name, maxLength = 20) => {
@@ -1454,7 +1513,10 @@ export default function App() {
                             style={{ width: `${msg.progress}%` }}
                           />
                         </div>
-                        <p className="text-xs opacity-80">{msg.progress}%</p>
+                        <div className="flex items-center justify-between text-xs opacity-80">
+                          <span>{msg.progress}%</span>
+                          <span>{formatSpeed(msg.speed)}</span>
+                        </div>
                       </div>
                     )}
                     {msg.type === "receiving" && (
@@ -1488,7 +1550,10 @@ export default function App() {
                             style={{ width: `${msg.progress}%` }}
                           />
                         </div>
-                        <p className="text-xs opacity-80">{msg.progress}%</p>
+                        <div className="flex items-center justify-between text-xs opacity-80">
+                          <span>{msg.progress}%</span>
+                          <span>{formatSpeed(msg.speed)}</span>
+                        </div>
                       </div>
                     )}
                     <p
