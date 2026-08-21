@@ -394,19 +394,17 @@ export default function App() {
     const allDone = meta.channels.every((ch) => ch.done);
     if (!allDone) return;
 
-    const totalReceived = meta.channels.reduce(
-      (sum, ch) => sum + ch.receivedSize,
-      0,
-    );
-
-    if (totalReceived >= meta.size) {
-      const allChunks = [];
+    if (meta.totalReceived >= meta.size) {
+      // 用子 Blob 合并，避免 spread 大数组导致调用栈压力和内存重复
+      // Blob 接受 Blob 数组作为构造参数，子 Blob 内部不立即拷贝数据
+      const subBlobs = [];
       for (let i = 0; i < meta.numChannels; i++) {
-        if (fileChunks.current[targetId][i]) {
-          allChunks.push(...fileChunks.current[targetId][i]);
+        const chunks = fileChunks.current[targetId][i];
+        if (chunks && chunks.length > 0) {
+          subBlobs.push(new Blob(chunks));
         }
       }
-      const blob = new Blob(allChunks, {
+      const blob = new Blob(subBlobs, {
         type: meta.fileType,
       });
       const url = URL.createObjectURL(blob);
@@ -438,7 +436,7 @@ export default function App() {
       addMessage(targetId, {
         sender: "system",
         type: "error",
-        content: `文件接收不完整 (${totalReceived}/${meta.size})`,
+        content: `文件接收不完整 (${meta.totalReceived}/${meta.size})`,
         timestamp: new Date().toISOString(),
       });
     }
@@ -487,6 +485,7 @@ export default function App() {
             fileMeta.current[targetId] = {
               ...parsed,
               channels,
+              totalReceived: 0,
             };
             fileChunks.current[targetId] = {};
 
@@ -549,27 +548,25 @@ export default function App() {
         }
         fileChunks.current[targetId][channelIndex].push(chunk);
         meta.channels[channelIndex].receivedSize += chunk.byteLength;
+        // 累计字段，避免每个 chunk 都 reduce O(numChannels) 计算
+        meta.totalReceived += chunk.byteLength;
 
-        const totalReceived = meta.channels.reduce(
-          (sum, ch) => sum + ch.receivedSize,
-          0,
-        );
         const transferState = fileTransferState.current[targetId];
 
-        const progress = Math.round((totalReceived / meta.size) * 100);
+        const progress = Math.round((meta.totalReceived / meta.size) * 100);
         if (transferState) {
           transferState.progress = progress;
-          transferState.totalReceived = totalReceived;
+          transferState.totalReceived = meta.totalReceived;
           const now = Date.now();
           const elapsed = (now - transferState.lastUpdateTime) / 1000;
           if (elapsed > 0.15) {
             const deltaBytes =
-              totalReceived - transferState.lastReceivedAtUpdate;
+              meta.totalReceived - transferState.lastReceivedAtUpdate;
             const instantSpeed = elapsed > 0 ? deltaBytes / elapsed : 0;
             transferState.smoothedSpeed =
               0.3 * instantSpeed + 0.7 * transferState.smoothedSpeed;
             transferState.lastUpdateTime = now;
-            transferState.lastReceivedAtUpdate = totalReceived;
+            transferState.lastReceivedAtUpdate = meta.totalReceived;
           }
           // 节流 UI 更新：250ms 一次或完成时更新，避免每 chunk 都 setState
           if (now - transferState.lastUiUpdate > 250 || progress === 100) {
