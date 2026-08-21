@@ -503,6 +503,7 @@ export default function App() {
               lastUpdateTime: Date.now(),
               lastReceivedAtUpdate: 0,
               smoothedSpeed: 0,
+              lastUiUpdate: 0,
             };
 
             addMessage(targetId, {
@@ -570,12 +571,16 @@ export default function App() {
             transferState.lastUpdateTime = now;
             transferState.lastReceivedAtUpdate = totalReceived;
           }
-          updateReceivingProgress(
-            targetId,
-            transferState.messageId,
-            progress,
-            transferState.smoothedSpeed,
-          );
+          // 节流 UI 更新：250ms 一次或完成时更新，避免每 chunk 都 setState
+          if (now - transferState.lastUiUpdate > 250 || progress === 100) {
+            transferState.lastUiUpdate = now;
+            updateReceivingProgress(
+              targetId,
+              transferState.messageId,
+              progress,
+              transferState.smoothedSpeed,
+            );
+          }
         }
       }
     };
@@ -671,16 +676,23 @@ export default function App() {
       };
       channels[0].send(JSON.stringify(meta));
 
-      const chunkSize = 256 * 1024;
-      const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024;
+      // 64KB chunk 是 WebRTC DataChannel 单条消息的最佳大小，避免 SCTP 分片
+      const chunkSize = 64 * 1024;
+      // 提高 buffer 阈值让更多数据并发发送，提升吞吐
+      const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
 
       const waitForBuffer = async (dc) => {
         while (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-          await new Promise((res) => setTimeout(res, 50));
+          await new Promise((res) => setTimeout(res, 5));
         }
       };
 
+      // 一次性把文件读到内存，避免每次 slice + 异步 arrayBuffer 读取的开销
+      const fileBuffer = await file.arrayBuffer();
+
       const totalBytesSent = { value: 0 };
+      // UI 更新节流时间戳，多通道共享，避免每个 chunk 都触发 setState
+      const lastUiUpdate = { time: 0 };
 
       const sendChannelData = async (channelIndex) => {
         return new Promise(async (resolve) => {
@@ -694,36 +706,35 @@ export default function App() {
               ? file.size
               : (channelIndex + 1) * chunkPerChannel;
 
-          console.log(`[sendChannelData] channel ${channelIndex}: start=${startOffset}, end=${endOffset}, chunkPerChannel=${chunkPerChannel}, file.size=${file.size}`);
-
           let offset = startOffset;
 
           while (offset < endOffset) {
-            console.log(`[sendChannelData] channel ${channelIndex}: offset=${offset}, endOffset=${endOffset}`);
-            
             if (fileTransferState.current[targetId]?.cancelled) {
               resolve();
               return;
             }
 
-            await waitForBuffer(dc);
+            if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+              await waitForBuffer(dc);
+            }
 
-            const slice = file.slice(
-              offset,
-              Math.min(offset + chunkSize, endOffset),
-            );
-            const arrayBuffer = await slice.arrayBuffer();
+            const sliceEnd = Math.min(offset + chunkSize, endOffset);
+            // ArrayBuffer.prototype.slice 是同步的，比 Blob.slice().arrayBuffer() 快得多
+            const chunk = fileBuffer.slice(offset, sliceEnd);
 
-            dc.send(arrayBuffer);
+            dc.send(chunk);
 
-            offset += arrayBuffer.byteLength;
-            totalBytesSent.value += arrayBuffer.byteLength;
+            offset = sliceEnd;
+            totalBytesSent.value += chunk.byteLength;
 
-            const progress = Math.round((Math.min(totalBytesSent.value, file.size) / file.size) * 100);
             const transferState = fileTransferState.current[targetId];
             if (transferState) {
+              const progress = Math.round(
+                (Math.min(totalBytesSent.value, file.size) / file.size) * 100,
+              );
               transferState.progress = progress;
               transferState.totalSent = totalBytesSent.value;
+
               const now = Date.now();
               const elapsed = (now - transferState.lastUpdateTime) / 1000;
               if (elapsed > 0.15) {
@@ -735,15 +746,18 @@ export default function App() {
                 transferState.lastUpdateTime = now;
                 transferState.lastSentAtUpdate = totalBytesSent.value;
               }
-              updateMessageProgress(
-                targetId,
-                messageId,
-                progress,
-                transferState.smoothedSpeed,
-              );
-            }
 
-            console.log(`[sendChannelData] channel ${channelIndex}: sent ${arrayBuffer.byteLength} bytes, total=${totalBytesSent.value}, progress=${progress}%`);
+              // 节流 UI 更新：250ms 一次或完成时更新，避免每 chunk 都 setState
+              if (now - lastUiUpdate.time > 250 || progress === 100) {
+                lastUiUpdate.time = now;
+                updateMessageProgress(
+                  targetId,
+                  messageId,
+                  progress,
+                  transferState.smoothedSpeed,
+                );
+              }
+            }
           }
 
           await waitForBuffer(dc);
@@ -751,10 +765,9 @@ export default function App() {
           dc.send(JSON.stringify({ type: "channel-end", channelIndex }));
 
           while (dc.bufferedAmount > 0) {
-            await new Promise((res) => setTimeout(res, 50));
+            await new Promise((res) => setTimeout(res, 5));
           }
 
-          console.log(`[sendChannelData] channel ${channelIndex}: finished, sent ${totalBytesSent.value} total bytes`);
           resolve();
         });
       };
