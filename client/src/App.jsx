@@ -355,6 +355,7 @@ export default function App() {
       return peerConnections.current[targetId];
 
     const pc = new RTCPeerConnection({
+      // 未配置 STUN/TURN，仅支持同一局域网内直连（使用 host 候选）
       iceServers: [],
     });
 
@@ -364,6 +365,29 @@ export default function App() {
           target: targetId,
           candidate: event.candidate,
         });
+      }
+    };
+
+    // 监听连接状态，便于排查"连接建立失败"的根本原因
+    pc.oniceconnectionstatechange = () => {
+      console.log(
+        `[${targetId}] ICE connection state: ${pc.iceConnectionState}`,
+      );
+      if (pc.iceConnectionState === "failed") {
+        console.error(
+          `[${targetId}] ICE 连接失败，无法穿透 NAT/防火墙。` +
+            (pc.getConfiguration().iceServers?.length === 0
+              ? " 注意：当前未配置 STUN/TURN，仅支持同一局域网。"
+              : ""),
+        );
+      }
+    };
+    pc.onconnectionstatechange = () => {
+      console.log(
+        `[${targetId}] Peer connection state: ${pc.connectionState}`,
+      );
+      if (pc.connectionState === "failed") {
+        console.error(`[${targetId}] PeerConnection 进入 failed 状态`);
       }
     };
 
@@ -452,24 +476,26 @@ export default function App() {
     }
     dataChannels.current[targetId][channelIndex] = channel;
 
-    channel.onopen = () =>
-      console.log(`Data channel ${channelIndex} with ${targetId} opened`);
-    channel.onclose = () => {
+    // 使用 addEventListener 避免后续 onopen 赋值覆盖，支持多处监听
+    channel.addEventListener("open", () =>
+      console.log(`Data channel ${channelIndex} with ${targetId} opened`),
+    );
+    channel.addEventListener("close", () => {
       console.log(`Data channel ${channelIndex} with ${targetId} closed`);
       const meta = fileMeta.current[targetId];
       if (meta && !meta.channels[channelIndex]?.done) {
         meta.channels[channelIndex].done = true;
         checkAllChannelsDone(targetId);
       }
-    };
-    channel.onerror = (error) => {
+    });
+    channel.addEventListener("error", (error) => {
       console.error(`Data channel ${channelIndex} error:`, error);
       const meta = fileMeta.current[targetId];
       if (meta && !meta.channels[channelIndex]?.done) {
         meta.channels[channelIndex].done = true;
         checkAllChannelsDone(targetId);
       }
-    };
+    });
 
     channel.onmessage = (event) => {
       const data = event.data;
@@ -603,18 +629,127 @@ export default function App() {
       }
 
       const waitForChannels = async () => {
-        const openPromises = channels.map(
-          (dc) =>
-            new Promise((res) => {
-              if (dc.readyState === "open") {
-                res();
-                return;
-              }
-              dc.onopen = () => res();
-              setTimeout(() => res(), 5000);
-            }),
+        // 全局监听 ICE / PeerConnection 失败，一旦失败让所有未完成的通道立即返回，不等待 15s 超时
+        let pcFailReason = null;
+        const pcFailCallbacks = [];
+        const triggerPcFail = (reason) => {
+          if (pcFailReason) return;
+          pcFailReason = reason;
+          console.error(
+            `[${targetId}] ICE/PeerConnection failed during channel wait: ${reason}`,
+          );
+          let cb;
+          while ((cb = pcFailCallbacks.shift())) {
+            cb(reason);
+          }
+        };
+        const checkPcState = () => {
+          if (pc.iceConnectionState === "failed")
+            triggerPcFail("ice-failed");
+          else if (pc.iceConnectionState === "disconnected")
+            triggerPcFail("ice-disconnected");
+          else if (pc.connectionState === "failed")
+            triggerPcFail("pc-failed");
+          else if (pc.connectionState === "closed")
+            triggerPcFail("pc-closed");
+        };
+        const onIceState = () => checkPcState();
+        const onPcState = () => checkPcState();
+        pc.addEventListener("iceconnectionstatechange", onIceState);
+        pc.addEventListener("connectionstatechange", onPcState);
+
+        const results = await Promise.all(
+          channels.map(
+            (dc, idx) =>
+              new Promise((resolveOne) => {
+                // 已打开直接成功
+                if (dc.readyState === "open") {
+                  resolveOne({ idx, ok: true });
+                  return;
+                }
+                // 已失败状态直接返回错误
+                if (
+                  dc.readyState === "closed" ||
+                  dc.readyState === "closing"
+                ) {
+                  console.warn(
+                    `Data channel ${idx} already in state ${dc.readyState} before waiting`,
+                  );
+                  resolveOne({ idx, ok: false, reason: dc.readyState });
+                  return;
+                }
+                // PC 已失败，直接快速返回
+                if (pcFailReason) {
+                  resolveOne({ idx, ok: false, reason: pcFailReason });
+                  return;
+                }
+
+                let settled = false;
+                const timeoutMs = 20000; // STUN 收集 + ICE 握手整体预留 20s
+
+                const cleanup = () => {
+                  settled = true;
+                  clearTimeout(timer);
+                  const failIdx = pcFailCallbacks.indexOf(onPcFail);
+                  if (failIdx >= 0) pcFailCallbacks.splice(failIdx, 1);
+                  dc.removeEventListener("open", onOpen);
+                  dc.removeEventListener("error", onError);
+                  dc.removeEventListener("close", onClose);
+                };
+
+                const onOpen = () => {
+                  if (settled) return;
+                  cleanup();
+                  resolveOne({ idx, ok: true });
+                };
+                const onError = (e) => {
+                  if (settled) return;
+                  cleanup();
+                  console.error(`Data channel ${idx} error during wait:`, e);
+                  resolveOne({ idx, ok: false, reason: "error" });
+                };
+                const onClose = () => {
+                  if (settled) return;
+                  cleanup();
+                  console.warn(`Data channel ${idx} closed before open`);
+                  resolveOne({ idx, ok: false, reason: "closed" });
+                };
+                const onPcFail = (reason) => {
+                  if (settled) return;
+                  cleanup();
+                  resolveOne({ idx, ok: false, reason });
+                };
+                pcFailCallbacks.push(onPcFail);
+
+                const timer = setTimeout(() => {
+                  if (settled) return;
+                  // 若最终仍在 checking，给出更明确的原因提示
+                  let reason = "timeout";
+                  if (pc.iceConnectionState === "checking") {
+                    reason = "ice-checking-timeout";
+                  } else if (pc.iceConnectionState === "new") {
+                    reason = "ice-no-candidates";
+                  }
+                  cleanup();
+                  console.warn(
+                    `Data channel ${idx} timeout, state=${dc.readyState}, iceState=${pc.iceConnectionState}`,
+                  );
+                  resolveOne({ idx, ok: false, reason });
+                }, timeoutMs);
+
+                dc.addEventListener("open", onOpen);
+                dc.addEventListener("error", onError);
+                dc.addEventListener("close", onClose);
+                // 入队后再做一次状态检查，防止注册回调期间 PC 已经失败
+                checkPcState();
+              }),
+          ),
         );
-        await Promise.all(openPromises);
+
+        pc.removeEventListener("iceconnectionstatechange", onIceState);
+        pc.removeEventListener("connectionstatechange", onPcState);
+
+        return results;
       };
 
       addMessage(targetId, {
@@ -624,18 +759,43 @@ export default function App() {
         timestamp: new Date().toISOString(),
       });
 
-      await waitForChannels();
-
-      const allOpen = channels.every((dc) => dc.readyState === "open");
+      const results = await waitForChannels();
+      const allOpen = results.every((r) => r.ok);
       if (!allOpen) {
+        // 将内部 reason 转为用户可理解的中文提示
+        const reasonLabel = {
+          timeout: "连接超时",
+          "ice-checking-timeout": "ICE协商超时(请检查网络/关闭VPN)",
+          "ice-no-candidates": "未收集到可用候选(请检查网络)",
+          "ice-failed": "穿透失败(双方需在同一局域网或配置TURN)",
+          "ice-disconnected": "ICE已断开",
+          "pc-failed": "PeerConnection失败",
+          "pc-closed": "PeerConnection已关闭",
+          error: "通道错误",
+          closed: "通道已关闭",
+          closing: "通道正在关闭",
+        };
+        const firstReason =
+          results.find((r) => !r.ok)?.reason || "unknown";
+        const tip = reasonLabel[firstReason] || firstReason;
+        const failedList = results
+          .filter((r) => !r.ok)
+          .map((r) => `通道${r.idx}`)
+          .join(", ");
+        console.error(
+          `Data channels failed to open: ${results
+            .filter((r) => !r.ok)
+            .map((r) => `通道${r.idx}(${r.reason})`)
+            .join(", ")}`,
+        );
         removeInfoMessages(targetId);
         addMessage(targetId, {
           sender: "system",
           type: "error",
-          content: "连接建立失败，请重试",
+          content: `连接建立失败：${tip}（${failedList}）。请确认对方在线、在同一局域网（或关闭 VPN/防火墙）后重试`,
           timestamp: new Date().toISOString(),
         });
-        reject(new Error("连接建立失败"));
+        reject(new Error(`连接建立失败: ${firstReason}`));
         return;
       }
 
@@ -966,7 +1126,12 @@ export default function App() {
 
       // 依次发送每个文件
       for (const file of files) {
-        await initiateFileTransfer(selectedUser.id, file);
+        try {
+          await initiateFileTransfer(selectedUser.id, file);
+        } catch (err) {
+          // 错误已通过 addMessage 提示给用户，这里仅捕获避免 Uncaught (in promise) 冒泡
+          console.warn("文件发送已取消或失败:", err?.message || err);
+        }
       }
     }
   };
