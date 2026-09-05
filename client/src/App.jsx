@@ -163,6 +163,8 @@ export default function App() {
   const fileMeta = useRef({}); // { userId: { name, size, type, numChannels, channels: [{ receivedSize: 0, done: false }, ...] } }
   const pendingCandidates = useRef({}); // { userId: [RTCIceCandidate, ...] }
   const fileTransferState = useRef({}); // { userId: { progress: number, cancelled: boolean, messageId: string } }
+  // 接收端 OPFS 流式写盘器：{ userId: { status, dir, handle, writable, chains, offsets, pending, afterInit } }
+  const fileDiskWriters = useRef({});
 
   useEffect(() => {
     localStorage.setItem("customRooms", JSON.stringify(customRooms));
@@ -411,43 +413,168 @@ export default function App() {
     return pc;
   };
 
-  const checkAllChannelsDone = (targetId) => {
-    const meta = fileMeta.current[targetId];
-    if (!meta) return;
+  // 将接收到的 chunk 投递到 OPFS 磁盘文件或内存数组（浏览器不支持 OPFS 时的回退方案）
+  const deliverReceivedChunk = (targetId, channelIndex, chunk, writer) => {
+    if (!writer || writer.status === "memory") {
+      if (!fileChunks.current[targetId][channelIndex]) {
+        fileChunks.current[targetId][channelIndex] = [];
+      }
+      fileChunks.current[targetId][channelIndex].push(chunk);
+      return;
+    }
+    if (writer.status === "disk") {
+      const position = writer.offsets[channelIndex];
+      writer.offsets[channelIndex] = position + chunk.byteLength;
+      // 每条通道维护独立的写入 Promise 链；position 显式指定，乱序完成也不会写错位置
+      writer.chains[channelIndex] = writer.chains[channelIndex]
+        .then(() =>
+          writer.writable.write({
+            type: "write",
+            position,
+            data: chunk,
+          }),
+        )
+        .catch((e) => {
+          console.error(`通道 ${channelIndex} 写盘失败:`, e);
+          writer.status = "error";
+        });
+      return;
+    }
+    // writer.status === "init"：OPFS 初始化尚未完成，先排队稍后 flush
+    writer.pending.push({ ch: channelIndex, chunk });
+  };
 
-    const allDone = meta.channels.every((ch) => ch.done);
-    if (!allDone) return;
+  // 初始化 OPFS 流式写入器：接收数据直接写磁盘，文件不驻留内存。
+  // 关键意义：大文件时内存累积上万个 ArrayBuffer 会触发频繁 GC 暂停，
+  // 接收线程来不及消费 SCTP 消息，SCTP 接收窗口收缩到 0，发送端被零窗口逼停，
+  // 这是接收速度远低于链路速度的主要原因。
+  const initDiskWriter = async (targetId, meta, writer) => {
+    try {
+      if (!navigator.storage?.getDirectory) {
+        throw new Error("当前浏览器不支持 OPFS");
+      }
+      const dir = await navigator.storage.getDirectory();
+      const safeName = `recv-${Date.now()}-${meta.name}`.replace(
+        /[\\/:*?"<>|]/g,
+        "_",
+      );
+      const handle = await dir.getFileHandle(safeName, { create: true });
+      const writable = await handle.createWritable();
 
-    if (meta.totalReceived >= meta.size) {
-      // 用子 Blob 合并，避免 spread 大数组导致调用栈压力和内存重复
-      // Blob 接受 Blob 数组作为构造参数，子 Blob 内部不立即拷贝数据
-      const subBlobs = [];
+      writer.dir = dir;
+      writer.handle = handle;
+      writer.writable = writable;
+      writer.chains = [];
+      writer.offsets = [];
       for (let i = 0; i < meta.numChannels; i++) {
-        const chunks = fileChunks.current[targetId][i];
-        if (chunks && chunks.length > 0) {
-          subBlobs.push(new Blob(chunks));
+        writer.chains.push(Promise.resolve());
+        writer.offsets.push(0);
+      }
+      writer.status = "disk";
+    } catch (e) {
+      console.warn("OPFS 流式写盘不可用，回退到内存接收模式:", e);
+      writer.status = "memory";
+    }
+
+    // 初始化期间传输可能已被超时/错误清理，放弃该孤儿写入器，避免临时文件泄漏
+    if (fileDiskWriters.current[targetId] !== writer) {
+      if (writer.status === "disk") {
+        writer.writable.abort?.().catch(() => {});
+        writer.dir?.removeEntry?.(writer.handle?.name).catch(() => {});
+      }
+      return;
+    }
+
+    // flush 初始化期间到达的 chunk
+    const pending = writer.pending;
+    writer.pending = [];
+    for (const item of pending) {
+      deliverReceivedChunk(targetId, item.ch, item.chunk, writer);
+    }
+
+    // 小文件可能在初始化完成前就已收完，补一次完成检查
+    if (writer.afterInit) {
+      const cb = writer.afterInit;
+      writer.afterInit = null;
+      cb();
+    }
+  };
+
+  // 接收方清理传输状态（超时/失败共用）
+  const cleanupReceiverTransfer = (targetId) => {
+    const writer = fileDiskWriters.current[targetId];
+    if (writer) {
+      if (writer.status === "disk" && writer.writable) {
+        writer.writable.abort?.().catch(() => {});
+        if (writer.handle) {
+          writer.dir?.removeEntry?.(writer.handle.name).catch(() => {});
         }
       }
-      const blob = new Blob(subBlobs, {
-        type: meta.fileType,
-      });
-      const url = URL.createObjectURL(blob);
+      delete fileDiskWriters.current[targetId];
+    }
+    fileChunks.current[targetId] = {};
+    fileMeta.current[targetId] = null;
+    delete fileTransferState.current[targetId];
+  };
 
-      const transferState = fileTransferState.current[targetId];
-      const receivingMessageId = transferState?.messageId;
-      if (receivingMessageId) {
-        setMessages((prev) => {
-          const msgs = prev[targetId] || [];
-          const newMsgs = msgs.filter(
-            (msg) => msg.messageId !== receivingMessageId,
-          );
-          return {
-            ...prev,
-            [targetId]: newMsgs,
-          };
-        });
+  // 所有通道数据接收完毕后的收尾：等待写盘完成、关闭句柄、生成下载 URL
+  const finalizeReceivedFile = async (targetId, meta) => {
+    const writer = fileDiskWriters.current[targetId];
+    let url = null;
+    let failed = false;
+
+    try {
+      if (writer?.status === "disk") {
+        await Promise.all(writer.chains);
+        if (writer.status === "error") {
+          throw new Error("写盘过程中发生错误");
+        }
+        await writer.writable.write({ type: "truncate", size: meta.size });
+        await writer.writable.close();
+        const diskFile = await writer.handle.getFile();
+        url = URL.createObjectURL(diskFile);
+        // Blob URL 已持有文件数据，best-effort 删除 OPFS 临时条目，避免长期占用磁盘
+        try {
+          await writer.dir.removeEntry(writer.handle.name);
+        } catch (e) {
+          /* 部分平台文件句柄占用时会在释放后由浏览器回收 */
+        }
+      } else {
+        // 内存回退路径：用子 Blob 合并，避免 spread 大数组导致调用栈压力和内存重复
+        const subBlobs = [];
+        for (let i = 0; i < meta.numChannels; i++) {
+          const chunks = fileChunks.current[targetId]?.[i];
+          if (chunks && chunks.length > 0) {
+            subBlobs.push(new Blob(chunks));
+          }
+        }
+        const blob = new Blob(subBlobs, { type: meta.fileType });
+        url = URL.createObjectURL(blob);
       }
+    } catch (e) {
+      console.error("接收文件收尾失败:", e);
+      failed = true;
+      if (writer?.status === "disk" && writer.writable) {
+        writer.writable.abort?.().catch(() => {});
+        writer.dir?.removeEntry?.(writer.handle?.name).catch(() => {});
+      }
+    }
 
+    const transferState = fileTransferState.current[targetId];
+    const receivingMessageId = transferState?.messageId;
+    if (receivingMessageId) {
+      setMessages((prev) => {
+        const msgs = prev[targetId] || [];
+        return {
+          ...prev,
+          [targetId]: msgs.filter(
+            (msg) => msg.messageId !== receivingMessageId,
+          ),
+        };
+      });
+    }
+
+    if (url) {
       addMessage(targetId, {
         sender: "them",
         type: "file",
@@ -460,14 +587,58 @@ export default function App() {
       addMessage(targetId, {
         sender: "system",
         type: "error",
-        content: `文件接收不完整 (${meta.totalReceived}/${meta.size})`,
+        content: failed
+          ? "文件接收失败（写入磁盘出错）"
+          : `文件接收不完整 (${meta.totalReceived}/${meta.size})`,
         timestamp: new Date().toISOString(),
       });
     }
 
     fileChunks.current[targetId] = {};
     fileMeta.current[targetId] = null;
+    delete fileDiskWriters.current[targetId];
     delete fileTransferState.current[targetId];
+  };
+
+  const checkAllChannelsDone = (targetId) => {
+    const meta = fileMeta.current[targetId];
+    if (!meta) return;
+
+    const allDone = meta.channels.every((ch) => ch.done);
+    if (!allDone) return;
+
+    const writer = fileDiskWriters.current[targetId];
+    // 写盘器还在初始化（小文件可能瞬间传完），等初始化结束后再收尾
+    if (writer && writer.status === "init") {
+      writer.afterInit = () => checkAllChannelsDone(targetId);
+      return;
+    }
+
+    if (meta.totalReceived < meta.size || writer?.status === "error") {
+      const transferState = fileTransferState.current[targetId];
+      if (transferState?.messageId) {
+        const mid = transferState.messageId;
+        setMessages((prev) => ({
+          ...prev,
+          [targetId]: (prev[targetId] || []).filter(
+            (msg) => msg.messageId !== mid,
+          ),
+        }));
+      }
+      addMessage(targetId, {
+        sender: "system",
+        type: "error",
+        content:
+          writer?.status === "error"
+            ? "文件接收失败（写入磁盘出错）"
+            : `文件接收不完整 (${meta.totalReceived}/${meta.size})`,
+        timestamp: new Date().toISOString(),
+      });
+      cleanupReceiverTransfer(targetId);
+      return;
+    }
+
+    finalizeReceivedFile(targetId, meta);
   };
 
   const setupDataChannel = (targetId, channel, channelIndex) => {
@@ -515,6 +686,20 @@ export default function App() {
             };
             fileChunks.current[targetId] = {};
 
+            // OPFS 流式写盘（浏览器支持时）：数据边收边写磁盘，内存恒定、无 GC 停顿
+            const writer = {
+              status: "init",
+              dir: null,
+              handle: null,
+              writable: null,
+              chains: [],
+              offsets: [],
+              pending: [],
+              afterInit: null,
+            };
+            fileDiskWriters.current[targetId] = writer;
+            initDiskWriter(targetId, parsed, writer);
+
             removeInfoMessages(targetId);
 
             const messageId = `receiving-${Date.now()}`;
@@ -557,9 +742,7 @@ export default function App() {
               timestamp: new Date().toISOString(),
             });
 
-            fileChunks.current[targetId] = {};
-            fileMeta.current[targetId] = null;
-            delete fileTransferState.current[targetId];
+            cleanupReceiverTransfer(targetId);
           }
         } catch (e) {
           console.error("Failed to parse string data", e);
@@ -569,13 +752,17 @@ export default function App() {
         if (!meta) return;
 
         const chunk = data;
-        if (!fileChunks.current[targetId][channelIndex]) {
-          fileChunks.current[targetId][channelIndex] = [];
-        }
-        fileChunks.current[targetId][channelIndex].push(chunk);
         meta.channels[channelIndex].receivedSize += chunk.byteLength;
         // 累计字段，避免每个 chunk 都 reduce O(numChannels) 计算
         meta.totalReceived += chunk.byteLength;
+
+        // 热路径只做入队：写磁盘（OPFS）或累积到内存（回退），不在此处做任何重活
+        deliverReceivedChunk(
+          targetId,
+          channelIndex,
+          chunk,
+          fileDiskWriters.current[targetId],
+        );
 
         const transferState = fileTransferState.current[targetId];
 
@@ -833,52 +1020,77 @@ export default function App() {
       };
       channels[0].send(JSON.stringify(meta));
 
-      // 64KB chunk 是 WebRTC DataChannel 单条消息的最佳大小，避免 SCTP 分片
+      // 64KB 是 DataChannel 消息的安全大小（SCTP 内部会按 MTU 自动分片/重组）
       const chunkSize = 64 * 1024;
-      // 提高 buffer 阈值让更多数据并发发送，提升吞吐
-      const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
+      // 每通道缓冲高水位：超过则暂停读文件，等 bufferedamountlow 事件唤醒。
+      // 事件驱动替代原来的 5ms 轮询，消除轮询粒度导致的管道断流和 CPU 空转。
+      const HIGH_WATER_MARK = 4 * 1024 * 1024;
 
-      const waitForBuffer = async (dc) => {
-        while (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-          await new Promise((res) => setTimeout(res, 5));
-        }
-      };
-
-      // 一次性把文件读到内存，避免每次 slice + 异步 arrayBuffer 读取的开销
-      const fileBuffer = await file.arrayBuffer();
+      // 事件驱动的背压等待：bufferedAmount 降到阈值以下时事件立即唤醒；
+      // 50ms 轮询仅作兜底，防止极端情况下事件缺失导致卡死。
+      const waitUntilBufferedBelow = (dc, target) =>
+        new Promise((resolve) => {
+          if (dc.bufferedAmount <= target || dc.readyState !== "open") {
+            resolve();
+            return;
+          }
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            clearInterval(timer);
+            dc.removeEventListener("bufferedamountlow", onLow);
+            resolve();
+          };
+          const onLow = () => {
+            if (dc.bufferedAmount <= target) finish();
+          };
+          const timer = setInterval(() => {
+            if (dc.bufferedAmount <= target || dc.readyState !== "open") {
+              finish();
+            }
+          }, 50);
+          dc.addEventListener("bufferedamountlow", onLow);
+        });
 
       const totalBytesSent = { value: 0 };
+      const sendFailed = { value: false };
       // UI 更新节流时间戳，多通道共享，避免每个 chunk 都触发 setState
       const lastUiUpdate = { time: 0 };
 
       const sendChannelData = async (channelIndex) => {
-        return new Promise(async (resolve) => {
-          const dc = channels[channelIndex];
-          dc.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT / 2;
+        const dc = channels[channelIndex];
+        dc.bufferedAmountLowThreshold = HIGH_WATER_MARK;
 
-          const chunkPerChannel = Math.ceil(file.size / numChannels);
-          const startOffset = channelIndex * chunkPerChannel;
-          const endOffset =
-            channelIndex === numChannels - 1
-              ? file.size
-              : (channelIndex + 1) * chunkPerChannel;
+        const chunkPerChannel = Math.ceil(file.size / numChannels);
+        const startOffset = channelIndex * chunkPerChannel;
+        const endOffset =
+          channelIndex === numChannels - 1
+            ? file.size
+            : (channelIndex + 1) * chunkPerChannel;
 
-          let offset = startOffset;
+        let offset = startOffset;
 
+        try {
           while (offset < endOffset) {
-            if (fileTransferState.current[targetId]?.cancelled) {
-              resolve();
-              return;
+            if (fileTransferState.current[targetId]?.cancelled) return;
+            if (dc.readyState !== "open") {
+              throw new Error(`data channel ${channelIndex} not open`);
             }
 
-            if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-              await waitForBuffer(dc);
+            if (dc.bufferedAmount > HIGH_WATER_MARK) {
+              // 事件驱动等待缓冲区排空，避免轮询导致发送节奏断裂
+              await waitUntilBufferedBelow(dc, HIGH_WATER_MARK);
+              continue; // 唤醒后重新检查取消/通道状态
             }
 
             const sliceEnd = Math.min(offset + chunkSize, endOffset);
-            // ArrayBuffer.prototype.slice 是同步的，比 Blob.slice().arrayBuffer() 快得多
-            const chunk = fileBuffer.slice(offset, sliceEnd);
+            // 按需分块读取文件（OS 文件缓存保证读取速度），不再把整个文件读入内存
+            const chunk = await file.slice(offset, sliceEnd).arrayBuffer();
 
+            if (dc.readyState !== "open") {
+              throw new Error(`data channel ${channelIndex} closed`);
+            }
             dc.send(chunk);
 
             offset = sliceEnd;
@@ -917,16 +1129,16 @@ export default function App() {
             }
           }
 
-          await waitForBuffer(dc);
-
+          // 先发送结束标记（同通道内有序，保证在所有数据之后到达），再等待全部排空
           dc.send(JSON.stringify({ type: "channel-end", channelIndex }));
-
-          while (dc.bufferedAmount > 0) {
-            await new Promise((res) => setTimeout(res, 5));
+          dc.bufferedAmountLowThreshold = 0;
+          await waitUntilBufferedBelow(dc, 0);
+        } catch (e) {
+          if (!fileTransferState.current[targetId]?.cancelled) {
+            console.error(`通道 ${channelIndex} 发送失败:`, e);
+            sendFailed.value = true;
           }
-
-          resolve();
-        });
+        }
       };
 
       const sendPromises = [];
@@ -937,6 +1149,25 @@ export default function App() {
       await Promise.all(sendPromises);
 
       if (fileTransferState.current[targetId]?.cancelled) {
+        return;
+      }
+
+      if (sendFailed.value) {
+        setMessages((prev) => {
+          const msgs = prev[targetId] || [];
+          return {
+            ...prev,
+            [targetId]: msgs.filter((msg) => msg.messageId !== messageId),
+          };
+        });
+        addMessage(targetId, {
+          sender: "system",
+          type: "error",
+          content: "文件传输中断（数据通道已关闭），请重试",
+          timestamp: new Date().toISOString(),
+        });
+        delete fileTransferState.current[targetId];
+        reject(new Error("数据通道发送失败"));
         return;
       }
 
