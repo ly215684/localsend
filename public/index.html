@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <!-- 移动端视口：禁止缩放抖动，viewport-fit=cover 适配刘海屏 -->
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f766e" />
+  <title>局域网快传 · WebRTC 文件/文字直传</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="app">
+
+  <!-- ============ 左侧：设备列表 ============ -->
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="brand-logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <h1>局域网快传</h1>
+        <small>WebRTC 点对点直连 · 数据不经服务器</small>
+      </div>
+    </div>
+
+    <div class="self-card">
+      <label class="field-label" for="selfName">我的设备名</label>
+      <input id="selfName" type="text" maxlength="20" autocomplete="off"
+             placeholder="给自己起个名字" />
+      <div class="access-hint" id="accessHint">
+        <span class="access-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/>
+            <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+          </svg>
+        </span>
+        <span id="accessText">正在获取局域网访问地址…</span>
+      </div>
+    </div>
+
+    <div class="section-title">
+      <span>在线设备</span>
+      <span class="peer-count" id="peerCount">0</span>
+    </div>
+    <div id="peerList" class="peer-list">
+      <div class="peer-empty" id="peerEmpty">
+        <div class="peer-empty-icon">📡</div>
+        <p>暂未发现其他设备</p>
+        <small>请让对方用浏览器打开上面的<br/>局域网访问地址</small>
+      </div>
+    </div>
+
+    <div class="sidebar-foot" id="connState">信令连接中…</div>
+  </aside>
+
+  <!-- ============ 右侧：会话区 ============ -->
+  <section id="chatPanel">
+    <header class="chat-head">
+      <button class="icon-btn back-btn" id="backBtn" title="返回设备列表" aria-label="返回设备列表">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+             stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="15 18 9 12 15 6"/>
+        </svg>
+      </button>
+      <div class="chat-avatar" id="chatAvatar">?</div>
+      <div class="chat-meta">
+        <div class="chat-name" id="chatName">未选择设备</div>
+        <div class="chat-status" id="chatStatus">请从左侧选择一位在线设备</div>
+      </div>
+      <button class="icon-btn danger" id="disconnectBtn" title="断开连接" aria-label="断开连接" hidden>
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/>
+        </svg>
+      </button>
+    </header>
+
+    <div class="messages-wrap" id="messagesWrap">
+      <div class="messages" id="messages">
+        <div class="chat-placeholder" id="chatPlaceholder">
+          <div class="placeholder-illus">
+            <svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor"
+                 stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/>
+            </svg>
+          </div>
+          <p>选择一位在线设备，即可开始加密直连</p>
+          <small>支持文字消息、任意大小文件<br/>同一局域网下无需联网</small>
+        </div>
+      </div>
+      <div class="drop-mask" id="dropMask">
+        <div>
+          <div class="drop-icon">📥</div>
+          <p>松开手指 / 鼠标，发送文件给对方</p>
+        </div>
+      </div>
+    </div>
+
+    <footer class="composer" id="composer">
+      <button class="icon-btn attach" id="attachBtn" title="发送文件" aria-label="发送文件">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+        </svg>
+      </button>
+      <input type="file" id="fileInput" multiple hidden />
+      <textarea id="textInput" rows="1"
+                placeholder="选择设备后输入消息，Enter 发送 / Shift+Enter 换行"
+                disabled></textarea>
+      <button class="send-btn" id="sendBtn" disabled>
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+          <path d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"/>
+        </svg>
+        <span>发送</span>
+      </button>
+    </footer>
+  </section>
+</div>
+
+<!-- 轻量提示条 -->
+<div id="toast" class="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>
