@@ -802,6 +802,19 @@ a.file-btn.primary { text-decoration: none; }
   .msg { max-width: 88%; }
   .file-card { width: 230px; }
 
+  /* 输入框本体保持 16px（防 iOS 聚焦缩放），仅缩小 placeholder 让其单行显示 */
+  #textInput {
+    padding: 10px 12px;
+  }
+
+  #textInput::placeholder {
+    font-size: 12px;
+    line-height: 1.4;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   .send-btn span { display: none; }
   .send-btn {
     width: 42px;

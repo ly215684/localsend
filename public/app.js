@@ -1061,12 +1061,14 @@ function refreshChatHead() {
 function refreshComposer() {
   const peer = activePeer;
   const ok = !!(peer && peer.status === 'connected');
+  const mobile = isMobileScreen();
   textInput.disabled = !ok;
   sendBtn.disabled = !ok;
   attachBtn.disabled = !ok;
+  // 移动端提示文案缩短，配合 12px placeholder 字号保证单行显示
   textInput.placeholder = ok
-    ? '输入消息，Enter 发送 / Shift+Enter 换行'
-    : '请先选择设备并建立连接';
+    ? (mobile ? '输入消息…（Enter 发送）' : '输入消息，Enter 发送 / Shift+Enter 换行')
+    : (mobile ? '请先选择设备并连接' : '请先选择设备并建立连接');
 }
 
 function refreshPeerUI(peer) {
@@ -1274,6 +1276,12 @@ function init() {
   connectSSE();
   renderPeerList();
   refreshChatHead();
+
+  // 在移动/桌面断点间切换（旋转屏幕、缩放窗口）时同步 placeholder 文案
+  const mqMobile = window.matchMedia('(max-width: 760px)');
+  const onMqChange = () => refreshComposer();
+  if (mqMobile.addEventListener) mqMobile.addEventListener('change', onMqChange);
+  else if (mqMobile.addListener) mqMobile.addListener(onMqChange); // 旧版 Safari
 }
 
 init();
