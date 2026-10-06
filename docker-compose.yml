@@ -1,0 +1,29 @@
+services:
+  lan-transfer:
+    build: .
+    image: lan-transfer:latest
+    container_name: lan-transfer
+    # 宿主机端口可用环境变量覆盖，例如：PORT=8080 docker compose up -d
+    ports:
+      - "${PORT:-3000}:3000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/config"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+    # ------------------------------------------------------------------
+    # 说明：本服务仅转发 WebRTC 建连信令，文件/文字数据走浏览器 P2P 直连，
+    # 因此默认的桥接网络 + 端口映射即可正常使用，局域网设备通过
+    # http://宿主机IP:3000 访问。
+    #
+    # 但桥接模式下 /api/config 返回的是容器 IP（172.x.x.x），页面左侧显示的
+    # 访问地址会不正确。Linux 宿主机建议改用主机网络让其返回真实局域网 IP：
+    #
+    #   network_mode: host
+    #
+    # （启用 host 模式后请删除上面的 ports 配置，容器内固定监听 3000；
+    #   Docker Desktop for Windows/Mac 需 4.34+ 并在设置中开启 host networking）
+    # ------------------------------------------------------------------
